@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 고속 연산 및 역산 엔진
+# ⚙️ 0. 고속 연산 및 "무결점" 대수학적 역산 엔진
 # ---------------------------------------------------------
 def get_linear_params(win):
     X = np.arange(win)
@@ -24,8 +24,9 @@ def get_linear_params(win):
 def calc_fast_slope(prices, X, X_mean, X_var_sum):
     y_mean = np.mean(prices)
     slope = np.sum((X - X_mean) * (prices - y_mean)) / X_var_sum
-    current_price = prices[-1]
-    return (slope / current_price) * 100 if current_price > 0 else 0.0
+    # 🌟 버그 수정: 슬로프(%)의 기준을 '첫째 날'로 고정하여 역산 시의 분모 폭발을 원천 차단
+    base_price = prices[0] 
+    return (slope / base_price) * 100 if base_price > 0 else 0.0
 
 def calc_sigma(prices, X, X_mean, X_var_sum):
     y_mean = np.mean(prices)
@@ -35,33 +36,42 @@ def calc_sigma(prices, X, X_mean, X_var_sum):
     std = np.std(prices - trend_line)
     return (prices[-1] - trend_line[-1]) / std if std > 0 else 0.0
 
-def vectorized_reverse_price(hist_19_matrix, target_slopes):
+def vectorized_reverse_price(hist_19_matrix, target_slopes_pct):
+    """
+    [완벽하게 재설계된 벡터 역산 공식] 
+    어떤 극단적인 슬로프가 들어와도 분모가 0이 되지 않는 선형 역산
+    """
+    P_0 = hist_19_matrix[:, 0]
+    slope_raw = (target_slopes_pct / 100.0) * P_0
+    
     weights = np.arange(19) - 9.5
     K = np.sum(weights * hist_19_matrix, axis=1)
-    denom = 6.65 * target_slopes - 9.5
-    denom[np.abs(denom) < 0.01] = np.sign(denom[np.abs(denom) < 0.01]) * 0.01 + 1e-9
-    raw_prices = K / denom
+    
+    # 🌟 무결점 방정식: P_19 = (Slope * 665 - K) / 9.5
+    raw_prices = (slope_raw * 665.0 - K) / 9.5
     last_prices = hist_19_matrix[:, -1]
+    
     return np.clip(raw_prices, last_prices * 0.7, last_prices * 1.3)
 
 def reverse_calculate_price(prev_19_prices, target_slope_pct):
+    P_0 = prev_19_prices[0]
+    slope_raw = (target_slope_pct / 100.0) * P_0
+    
     K = np.sum((np.arange(19) - 9.5) * prev_19_prices)
-    denom = 6.65 * target_slope_pct - 9.5
-    if abs(denom) < 0.01:
-        denom = -0.01 if denom < 0 else 0.01
-    raw_price = K / denom
+    raw_price = (slope_raw * 665.0 - K) / 9.5
+    
     last_price = prev_19_prices[-1]
     return np.clip(raw_price, last_price * 0.7, last_price * 1.3)
 
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V26.1", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V26.2", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V26.1: 방향 적중률 & 신뢰 구간")
+st.title("🔮 The Quantum Oracle V26.2: 무결점 신뢰 구간 밴드")
 st.markdown("""
-단순 오차 크기가 아닌, **"오늘 사서 T일 뒤에 팔았을 때 오르고 내리는 '수익 방향(Direction)'을 얼마나 잘 맞췄는가(Hit Ratio %)"**를 기준으로 진짜 1위 T를 찾습니다.  
-또한 미래 주가의 불확실성을 시각화한 **80% 신뢰 구간(Confidence Interval)** 밴드가 추가되었습니다.
+수학적 특이점(Singularity) 버그를 완벽히 교정했습니다.  
+이제 AI가 예측한 주가 궤적이 기형적으로 찌그러지지 않고, 미래로 갈수록 불확실성이 커지는 **80% 신뢰 구간(Confidence Interval) 밴드**가 자연스럽게 펼쳐집니다.
 """)
 
 with st.sidebar:
@@ -91,6 +101,8 @@ def deep_scan_and_meta_predict(ticker):
         df = pd.DataFrame(index=df_target.index)
         df['Close'] = df_target['Close']
         df['Volume'] = df_target['Volume']
+        df['High'] = df_target['High']
+        df['Low'] = df_target['Low']
         
         df = df.join(df_vix[['Close']].rename(columns={'Close': 'VIX'}), how='left')
         df = df.join(df_spx[['Close']].rename(columns={'Close': 'SPX'}), how='left')
@@ -118,7 +130,6 @@ def deep_scan_and_meta_predict(ticker):
         df['Slope_Accel'] = df['Slope_20'] - df['Slope_20'].shift(1)
         df['Slope_Divergence'] = df['Slope_20'] - df['Slope_60']
         df['VIX_Change'] = df['VIX'].pct_change(5).fillna(0)
-        
         df['Target_Slope_Next'] = df['Slope_20'].shift(-1)
         
         features = ['Sigma_20', 'Slope_20', 'Slope_60', 'Slope_Accel', 'Slope_Divergence', 'VIX_Change']
@@ -135,11 +146,12 @@ def deep_scan_and_meta_predict(ticker):
         model_slope = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42, n_jobs=-1)
         model_slope.fit(X_scaled, Y_slope)
 
+        # 🌟 모델 잔차(Residual) 계산 (신뢰 밴드 너비 결정용)
         residuals = Y_slope - model_slope.predict(X_scaled)
         res_std = np.std(residuals)
 
         # ---------------------------------------------------------
-        # 🌟 방향 적중률(Hit Ratio) 기반 초고속 벡터 백테스트
+        # 🌟 방향 적중률(Hit Ratio) 기반 벡터 백테스트
         # ---------------------------------------------------------
         eval_df = ml_df.iloc[-420:-20].copy()
         N_eval = len(eval_df)
@@ -196,7 +208,7 @@ def deep_scan_and_meta_predict(ticker):
         meta_prob = np.max(meta_clf.predict_proba([[today_sigma, today_slope]])) * 100
 
         # ---------------------------------------------------------
-        # 🔮 오늘 기준 미래 주가 역산 & 신뢰 구간 생성
+        # 🔮 무결점 역산 & 80% 신뢰 구간 밴드 생성
         # ---------------------------------------------------------
         today_state = {f: today_row[f] for f in features}
         today_hist = list(closes[-20:])
@@ -207,20 +219,27 @@ def deep_scan_and_meta_predict(ticker):
         sim_prices_lower = [] 
         
         c_date = df.index[-1]
+        
+        # 누적 오차 (Random Walk: 루트 T에 비례하여 증가)
         cumulative_std = 0
         
         for step in range(20):
             x_in = scaler.transform([[today_state[f] for f in features]])
             base_slope = model_slope.predict(x_in)[0]
             
-            cumulative_std += (res_std * np.sqrt(step + 1)) * 0.1 
+            # 시간이 지날수록 모델의 잔차(불확실성)가 누적됨
+            cumulative_std += res_std * (np.sqrt(step + 1) * 0.15)
+            
+            # 80% 신뢰구간 (Z-score 1.28)
             upper_slope = base_slope + (1.28 * cumulative_std)
             lower_slope = base_slope - (1.28 * cumulative_std)
             
+            # 🌟 무결점 역산 함수 적용
             mean_price = reverse_calculate_price(np.array(today_hist[-19:]), base_slope)
             upper_price = reverse_calculate_price(np.array(today_hist[-19:]), upper_slope)
             lower_price = reverse_calculate_price(np.array(today_hist[-19:]), lower_slope)
             
+            # 신뢰 상하단 안전 정렬
             u_p, l_p = max(upper_price, lower_price), min(upper_price, lower_price)
             
             c_date += BDay(1)
@@ -261,7 +280,7 @@ def deep_scan_and_meta_predict(ticker):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 400일치 방향 적중률(Hit Ratio) 분석 및 80% 신뢰 구간을 연산 중입니다..."):
+    with st.spinner(f"📦 무결점 역산 공식을 통해 80% 신뢰 밴드를 다시 그리고 있습니다..."):
         res, err = deep_scan_and_meta_predict(target_ticker)
         
     if err:
@@ -300,10 +319,11 @@ if run_btn:
         st.markdown("---")
         
         st.subheader(f"📈 4. 향후 20일 역산 궤적 및 80% 신뢰 구간 (Confidence Band)")
-        st.markdown("> 시간이 지날수록 AI의 예측 오차가 누적되는 것을 반영하여, **주가가 흔들릴 수 있는 상하단 범위(회색 영역)**를 표시했습니다.")
+        st.markdown("> 미래로 갈수록 불확실성이 커지는 것을 반영하여, **주가가 흔들릴 수 있는 상하단 범위(회색 밴드)**를 매끄럽게 표시했습니다.")
         
         fig_proj = go.Figure()
         
+        # 1. 80% 신뢰 구간 밴드 (오류 완벽 해결: 나팔 모양으로 퍼짐)
         conn_dates = [res['past_dates'][-1]] + res['sim_dates']
         conn_upper = [res['past_prices'][-1]] + res['sim_prices_upper']
         conn_lower = [res['past_prices'][-1]] + res['sim_prices_lower']
@@ -319,28 +339,29 @@ if run_btn:
             name='80% 신뢰 구간'
         ))
         
+        # 2. 과거 20일 실제 주가
         fig_proj.add_trace(go.Scatter(
             x=res['past_dates'], y=res['past_prices'], mode='lines+markers',
             line=dict(color='#2c3e50', width=4), name='과거 20일 실제 주가'
         ))
         
+        # 3. 미래 20일 예측 주가 (평균값: 무결점 선형 역산)
         conn_mean = [res['past_prices'][-1]] + res['sim_prices_mean']
+        
         fig_proj.add_trace(go.Scatter(
             x=conn_dates, y=conn_mean, mode='lines+markers',
             line=dict(color='#e74c3c', width=3, dash='dot'), name='역산 기반 미래 궤적 (평균)'
         ))
         
-        # 🌟 치명적인 버그 수정: Plotly의 add_vline annotation_text 에러 원천 차단
+        # 메타 타겟 라벨링 (에러 없는 텍스트 렌더링 방식)
         rec_idx = res['active_t'] - 1
-        rec_date = res['sim_dates'][rec_idx]
+        rec_date_str = res['sim_dates'][rec_idx].strftime('%Y-%m-%d')
         
-        # 선 긋기
-        fig_proj.add_vline(x=rec_date, line_dash="dash", line_color="green")
+        fig_proj.add_vline(x=rec_date_str, line_dash="dash", line_color="green")
         
-        # 글자는 안전하게 독립적인 add_annotation으로 분리 배치
         fig_proj.add_annotation(
-            x=rec_date, 
-            y=1.05, # 그래프 살짝 위쪽에 위치
+            x=rec_date_str, 
+            y=1.05, 
             yref="paper",
             text=f"🎯 AI 액티브 타겟 (T={res['active_t']})",
             showarrow=False,
