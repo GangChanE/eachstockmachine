@@ -3,67 +3,55 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import linregress
-from scipy.ndimage import uniform_filter1d, uniform_filter
-import time
+from scipy.ndimage import uniform_filter
+import math
 import warnings
-
-try:
-    from sklearn.linear_model import LogisticRegression
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
 
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 한국거래소(KRX) 호가 단위 맞춤형 함수
+# ⚙️ 0. 호가 절상 함수 (KRX 기준 반올림/올림)
 # ---------------------------------------------------------
-def round_to_tick(price):
-    """주가를 KRX 호가 단위에 맞춰 반올림합니다."""
+def round_to_tick(price, up=False):
+    """주가를 KRX 호가 단위에 맞춰 교정합니다. (up=True면 절상)"""
     if price is None or np.isnan(price): return None
     
-    if price < 2000:
-        tick = 1
-    elif price < 5000:
-        tick = 5
-    elif price < 20000:
-        tick = 10
-    elif price < 50000:
-        tick = 50
-    elif price < 200000:
-        tick = 100
-    elif price < 500000:
-        tick = 500
-    else:
-        tick = 1000
+    if price < 2000: tick = 1
+    elif price < 5000: tick = 5
+    elif price < 20000: tick = 10
+    elif price < 50000: tick = 50
+    elif price < 200000: tick = 100
+    elif price < 500000: tick = 500
+    else: tick = 1000
         
-    return round(price / tick) * tick
+    if up: return math.ceil(price / tick) * tick
+    else: return round(price / tick) * tick
 
 # ---------------------------------------------------------
-# ⚙️ 1. 페이지 설정 및 UI
+# ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V4 (호가 최적화)", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V5 (T-Day Holding)", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V4: 확률 구간 & 실전 호가 에디션")
+st.title("🔮 The Quantum Oracle V5: 보유 기간별(T일) 손익 예측기")
 st.markdown("""
-하나의 가격이 아닌 **[분할 매도 확률 구간(Zone)]**을 제시하며, 
-모든 출력 가격은 한국거래소(KRX)의 **실제 호가 단위(Tick Size)**에 맞춰 자동 교정됩니다.
+진입 지표 분석을 생략합니다. 과거 10년의 **장세(Regime)**를 5가지로 나누고,  
+현재 장세에서 시그마 값에 따라 **1일부터 60일까지 보유했을 때의 90% 예상 수익률 구간**을 모두 도출합니다.
 """)
 
 with st.sidebar:
     st.header("⚙️ 내 진입 정보")
     target_ticker = st.text_input("종목 코드 (티커)", value="000660.KS")
     entry_date = st.date_input("진입 날짜 (매수일)")
-    entry_price = st.number_input("매수 평단가 (원)", value=0.0, step=1000.0)
+    entry_price = st.number_input("매수 단가 (원)", value=0.0, step=1000.0)
     tax_rate = st.number_input("세율 적용 (%)", value=0.0, step=1.0) / 100.0
     fee = 0.003
-    run_btn = st.button("🚀 실전 매도 구간 분석", type="primary")
+    run_btn = st.button("🚀 T일별 손익 분석 및 전략 추출", type="primary")
 
 # ---------------------------------------------------------
 # ⚙️ 2. 핵심 분석 엔진
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def run_quantum_oracle_v4(ticker, ent_date, ent_price, tax, fee_rate):
+def run_t_day_oracle(ticker, ent_date, ent_price, tax, fee_rate):
     try:
         raw = yf.download(ticker, start="2014-01-01", progress=False)
         if raw.empty: return None, "데이터를 불러오지 못했습니다."
@@ -123,23 +111,61 @@ def run_quantum_oracle_v4(ticker, ent_date, ent_price, tax, fee_rate):
             else: fallback = [my_regime]
             regime_indices = np.where(np.isin(regimes, fallback))[0]
 
-        # ⏱️ 장세 맞춤형 T일 최적화
-        max_t = 30
-        t_corrs = []
+        # ---------------------------------------------------------
+        # ⏱️ Part 1: T=1 ~ 60일 예상 손익률 (90% 신뢰구간) 도출
+        # ---------------------------------------------------------
+        t_results = []
+        max_t = 60
+        
         for t in range(1, max_t + 1):
-            x_sig, y_ret = [], []
+            df_t = pd.DataFrame(columns=['Sigma', 'Return'])
+            sig_list, ret_list = [], []
+            
+            # 종가 기준으로 T일 후 수익률 계산
             for i in regime_indices:
                 if i + t < n_days:
-                    x_sig.append(sigmas[i])
-                    y_ret.append((closes[i+t] / closes[i]) - 1.0)
-            if len(x_sig) > 30: t_corrs.append(np.corrcoef(x_sig, y_ret)[0, 1])
-            else: t_corrs.append(0)
+                    sig_list.append(sigmas[i])
+                    profit = closes[i+t] - closes[i]
+                    tax_amt = profit * tax if profit > 0 else 0
+                    ret = ((closes[i+t] - tax_amt) / closes[i]) - 1.0 - fee_rate
+                    ret_list.append(ret * 100)
+                    
+            df_t = pd.DataFrame({'Sigma': sig_list, 'Return': ret_list})
+            
+            if df_t.empty: continue
                 
-        smooth_corrs = uniform_filter1d(t_corrs, size=5)
-        best_t = np.argmin(smooth_corrs) + 1
-        best_corr = smooth_corrs[best_t - 1]
+            # 시그마 0.2 단위 그룹핑
+            df_t['SigBin'] = np.round(df_t['Sigma'] / 0.2) * 0.2
+            
+            # 진입 시그마가 속한 그룹의 90% 신뢰구간 추출
+            my_bin = np.round(my_ent_sig / 0.2) * 0.2
+            bin_data = df_t[df_t['SigBin'] == my_bin]['Return']
+            
+            if len(bin_data) > 5:
+                # 90% 구간 (하위 5% ~ 상위 95%)
+                low_90 = np.percentile(bin_data, 5)
+                high_90 = np.percentile(bin_data, 95)
+                median_ret = np.median(bin_data)
+            else:
+                # 데이터가 부족하면 선형회귀식 사용
+                if len(df_t) > 2:
+                    slope, intercept, _, _, _ = linregress(df_t['Sigma'], df_t['Return'])
+                    median_ret = slope * my_ent_sig + intercept
+                    # 전체 데이터의 90% 잔차(Residual) 오차폭 적용
+                    residuals = df_t['Return'] - (slope * df_t['Sigma'] + intercept)
+                    err_margin = np.percentile(np.abs(residuals), 90)
+                    low_90 = median_ret - err_margin
+                    high_90 = median_ret + err_margin
+                else:
+                    low_90 = high_90 = median_ret = 0.0
+                    
+            t_results.append({
+                'T': t, 'Median': median_ret, 'Low90': low_90, 'High90': high_90
+            })
 
-        # 🛡️ 출구 최적화 (2D Grid)
+        # ---------------------------------------------------------
+        # 🛡️ Part 2: 맞춤형 출구 최적화 (2D Grid)
+        # ---------------------------------------------------------
         DROP_RANGE = np.round(np.arange(0.1, 5.1, 0.1), 1)
         EXT_RANGE = np.round(np.arange(-1.0, 5.1, 0.1), 1)
         shape = (len(DROP_RANGE), len(EXT_RANGE))
@@ -168,21 +194,13 @@ def run_quantum_oracle_v4(ticker, ent_date, ent_price, tax, fee_rate):
 
         smooth_ret = uniform_filter(ret_grid, size=3, mode='constant', cval=-100.0)
         if np.max(smooth_ret) == -100.0:
-            return None, f"[{my_regime}] 장세에서 진입 시그마({my_ent_sig:.2f})의 유효한 결과가 없습니다."
+            return None, f"[{my_regime}] 장세에서 진입 시그마의 유효한 결과가 없습니다."
             
         df_res = pd.DataFrame(all_res)
         df_res['Nb_Ret'] = df_res.apply(lambda r: smooth_ret[np.where(DROP_RANGE==r['Drop'])[0][0], np.where(EXT_RANGE==r['Ext'])[0][0]], axis=1)
         
-        # 🌟 상위 5개 전략을 모아 '확률적 매도 구간(Zone)' 도출
-        top_5_strategies = df_res.sort_values('Nb_Ret', ascending=False).head(5)
-        min_opt_ext = top_5_strategies['Ext'].min()
-        max_opt_ext = top_5_strategies['Ext'].max()
-        
-        # 만약 구간이 너무 좁다면(예: 0.1 이하 차이) 인위적으로 최소 0.3 시그마 밴드를 열어줌
-        if max_opt_ext - min_opt_ext < 0.2:
-            max_opt_ext += 0.3
-
-        best_strategy = top_5_strategies.iloc[0]
+        best_strategy = df_res.sort_values('Nb_Ret', ascending=False).iloc[0]
+        opt_ext = best_strategy['Ext']
         opt_drop = best_strategy['Drop']
         
         y_last = closes[-win20:]
@@ -190,53 +208,21 @@ def run_quantum_oracle_v4(ticker, ent_date, ent_price, tax, fee_rate):
         L_last = s_l*(win20-1) + i_l
         std_last = np.std(y_last - (s_l*x20 + i_l))
         
-        # 가격 역산 및 **호가 단위 반올림 적용**
-        target_price_min = round_to_tick(L_last + (min_opt_ext * std_last))
-        target_price_max = round_to_tick(L_last + (max_opt_ext * std_last))
+        # 목표가 절상 처리
+        target_price = round_to_tick(L_last + (opt_ext * std_last), up=True)
         
         recent_slopes = slopes20[closest_idx:]
         peak_slope = np.max(recent_slopes[recent_slopes != -999.0]) if len(recent_slopes) > 0 else slopes20[-1]
         cut_slope = peak_slope - opt_drop
 
-        # 로지스틱 확률 밴드 (호가 단위 적용)
-        bands = {}
-        cur_prob = 50.0
-        if HAS_SKLEARN:
-            X_train, Y_train = [], []
-            for i in regime_indices:
-                if i + best_t < n_days:
-                    X_train.append([sigmas[i]])
-                    Y_train.append(1 if closes[i+best_t] > closes[i] else 0)
-            
-            if len(X_train) > 50:
-                model = LogisticRegression().fit(X_train, Y_train)
-                coef_a, intercept_b = model.coef_[0][0], model.intercept_[0]
-                
-                def get_p_for_prob(p):
-                    if coef_a == 0: return None
-                    sig = - (np.log(1/p - 1) + intercept_b) / coef_a
-                    raw_price = L_last + (sig * std_last)
-                    return round_to_tick(raw_price) # 호가 단위 적용
-
-                bands = {
-                    "90% ~ 99%": (get_p_for_prob(0.99), get_p_for_prob(0.90)),
-                    "70% ~ 90%": (get_p_for_prob(0.90), get_p_for_prob(0.70)),
-                    "50% ~ 70%": (get_p_for_prob(0.70), get_p_for_prob(0.50)),
-                    "30% ~ 50%": (get_p_for_prob(0.50), get_p_for_prob(0.30)),
-                    "10% ~ 30%": (get_p_for_prob(0.30), get_p_for_prob(0.10)),
-                    " 1% ~ 10%": (get_p_for_prob(0.10), get_p_for_prob(0.01))
-                }
-                cur_prob = model.predict_proba([[sigmas[-1]]])[0][1] * 100
-
         res = {
             'regime': my_regime, 'ent_sigma': my_ent_sig,
-            'best_t': best_t, 'best_corr': best_corr,
-            'min_ext': min_opt_ext, 'max_ext': max_opt_ext, 'opt_drop': opt_drop,
-            'target_min': target_price_min, 'target_max': target_price_max, 
-            'cut_slope': cut_slope, 'cur_price': closes[-1], 
-            'cur_sigma': sigmas[-1], 'cur_slope': slopes20[-1], 'peak_slope': peak_slope,
-            'my_profit': ((closes[-1] / ent_price) - 1.0) * 100 if ent_price > 0 else 0.0,
-            'bands': bands, 'cur_prob': cur_prob
+            't_results': t_results,
+            'opt_ext': opt_ext, 'opt_drop': opt_drop,
+            'target_price': target_price, 'cut_slope': cut_slope,
+            'cur_price': closes[-1], 'cur_sigma': sigmas[-1], 
+            'cur_slope': slopes20[-1], 'peak_slope': peak_slope,
+            'my_profit': ((closes[-1] / ent_price) - 1.0) * 100 if ent_price > 0 else 0.0
         }
         return res, None
 
@@ -247,54 +233,56 @@ def run_quantum_oracle_v4(ticker, ent_date, ent_price, tax, fee_rate):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner("📦 실전 호가 단위 최적화 및 매도 확률 구간을 연산 중입니다..."):
-        res, err = run_quantum_oracle_v4(target_ticker, entry_date, entry_price, tax_rate, fee)
+    with st.spinner("📦 T=1~60일 손익 구간 탐색 및 최적 타점을 계산 중입니다... (1~2분 소요)"):
+        res, err = run_t_day_oracle(target_ticker, entry_date, entry_price, tax_rate, fee)
         
     if err:
         st.error(err)
     else:
         st.success(f"✅ 연산 완료! (해석된 장세: {res['regime']})")
         
-        # --- Part 1: 확률 밴드 렌더링 ---
-        if res['bands']:
-            st.subheader(f"🗺️ {res['best_t']}일 후 상승 확률 밴드 (호가 적용)")
-            cols = st.columns(6)
-            colors = ["#2ecc71", "#27ae60", "#f1c40f", "#e67e22", "#e74c3c", "#c0392b"]
-            for i, (name, val) in enumerate(res['bands'].items()):
-                with cols[i]:
-                    st.markdown(f"<h5 style='color:{colors[i]};'>{name}</h5>", unsafe_allow_html=True)
-                    if val[0] and val[1]:
-                        low_p, high_p = min(val), max(val)
-                        mark = " 👈 현재" if low_p <= res['cur_price'] <= high_p else ""
-                        st.write(f"₩{low_p:,}\n~\n₩{high_p:,}{mark}")
-                    else: st.caption("도달 불가")
+        # --- Part 1: T일별 손익률 렌더링 ---
+        st.subheader("🗓️ 1. 보유 기간(T일)별 예상 손익률 밴드 (90% 신뢰구간)")
+        st.markdown(f"> 당신의 진입 조건(시그마 **{res['ent_sigma']:.2f}**)과 유사한 상황에서 매수 후 **T일 동안 보유**했을 때의 90% 확률 통계입니다.")
         
+        # 결과를 15일 단위로 끊어서 컬럼으로 보여줌 (가독성 향상)
+        t_df = pd.DataFrame(res['t_results'])
+        c1, c2, c3, c4 = st.columns(4)
+        
+        for i, row in t_df.iterrows():
+            t_val = int(row['T'])
+            text = f"**T+{t_val:02d}일** : {row['Low90']:+5.1f}% ~ {row['High90']:+5.1f}% (평균 {row['Median']:+5.1f}%)"
+            
+            if t_val <= 15: c1.write(text)
+            elif t_val <= 30: c2.write(text)
+            elif t_val <= 45: c3.write(text)
+            else: c4.write(text)
+                
         st.markdown("---")
         
-        # --- Part 2: 장세 맞춤형 출구 최적화 (Zone) ---
-        st.subheader("🎯 장세 맞춤형 실전 매도 구간 (Zone)")
-        st.markdown(f"> 나의 진입 조건(Sigma **{res['ent_sigma']:.2f}**)에서 누적 수익금이 가장 컸던 **상위 5개 전략의 밀집 구간**입니다.")
+        # --- Part 2: 장세 맞춤형 출구 최적화 ---
+        st.subheader("🎯 2. 장세 맞춤형 최적 출구 전략 (AI 최적화)")
+        st.markdown(f"> T일 보유 기간과 무관하게, 추세(기울기)와 변동성(시그마)을 쫓아가며 가장 큰 누적 수익을 냈던 최적의 익절/손절 공식입니다.")
         
         col1, col2 = st.columns(2)
         with col1:
-            st.info(f"🔥 **통계적 분할 매도 구간 (Target Zone)**")
-            st.metric(label=f"Sigma {res['min_ext']:.1f} ~ {res['max_ext']:.1f} 도달 시", 
-                      value=f"₩{res['target_min']:,} ~ ₩{res['target_max']:,}")
-            st.caption("단일 가격이 아닙니다. 주가가 이 박스권(Zone)에 진입하면 보유 물량을 분할하여 익절하십시오. 가격은 실제 호가 단위에 맞춰 교정되었습니다.")
+            st.info(f"🔥 **통계적 익절 목표가 (호가 절상 적용)**")
+            st.metric(label=f"목표 시그마 ({res['opt_ext']:.1f}) 도달 시", value=f"₩{res['target_price']:,}")
+            st.caption("AI가 찾아낸 수학적 최적 익절가입니다. 이 가격에 도달하면 전량 또는 분할 매도하십시오.")
             
         with col2:
             st.error(f"🚨 **생명선 (Trailing Stop)**")
             st.metric(label=f"기울기 {res['cut_slope']:.2f}% (현재 {res['cur_slope']:.2f}%)", value=f"하락 시 전량 매도")
-            st.caption(f"최고 기울기({res['peak_slope']:.2f}%)에서 {res['opt_drop']:.1f}% 이상 꺾인 지점입니다. 목표 구간에 도달하지 않았어도 이 선이 깨지면 미련 없이 매도하십시오.")
+            st.caption(f"최고 기울기({res['peak_slope']:.2f}%)에서 {res['opt_drop']:.1f}% 이상 꺾인 지점입니다.")
             
         is_danger = res['cur_slope'] < res['cut_slope']
         
         st.markdown("---")
         st.subheader("🤖 미스터 주의 최종 행동 지침")
         if is_danger:
-            st.markdown(f"🚨 **[생명선 이탈]** 상승 추세가 꺾였습니다. (현재 기울기: {res['cur_slope']:.2f}% < 마지노선: {res['cut_slope']:.2f}%). 더 늦기 전에 즉시 전량 매도하십시오.")
-        elif res['cur_sigma'] >= res['min_ext']:
-            st.markdown(f"💰 **[매도 구간 진입]** 통계적 분할 매도 구간(Zone)에 들어왔습니다. 욕심을 버리고 정해진 호가에 맞춰 분할 익절을 시작하십시오.")
+            st.markdown(f"🚨 **[생명선 이탈]** 상승 추세가 꺾였습니다. (현재 기울기: {res['cur_slope']:.2f}% < 마지노선: {res['cut_slope']:.2f}%). T일 보유 확률과 무관하게 즉시 매도하여 자산을 보호하십시오.")
+        elif res['cur_sigma'] >= res['opt_ext']:
+            st.markdown(f"💰 **[목표가 도달]** 최적 익절 구간을 돌파했습니다. 미련 없이 익절하십시오.")
         else:
             rtn_text = f" (현재 수익률: {res['my_profit']:+.2f}%)" if entry_price > 0 else ""
-            st.markdown(f"🚀 **[순항 중 / 홀딩]** 아직 매도 구간에 도달하지 않았습니다. 생명선도 튼튼하게 주가를 받치고 있으니 평온하게 들고 가십시오.{rtn_text}")
+            st.markdown(f"🚀 **[순항 중 / 홀딩]** 아직 목표가에 도달하지 않았습니다. 위의 **T일 예상 손익률 밴드**를 참고하여 나의 목표 기간까지 멘탈을 관리하며 홀딩하십시오.{rtn_text}")
