@@ -35,30 +35,38 @@ def calc_sigma(prices, X, X_mean, X_var_sum):
     std = np.std(prices - trend_line)
     return (prices[-1] - trend_line[-1]) / std if std > 0 else 0.0
 
+# 🌟 400일 동시 다발 텐서 역산 (과거 백테스트용)
 def vectorized_reverse_price(hist_19_matrix, target_slopes):
-    """
-    [수학적 증명] 다차원 행렬(Matrix) 구조에서 내일의 주가를 한 번에 역산
-    P_next = sum((i - 9.5) * P_i) / (6.65 * Slope_pct - 9.5)
-    """
     weights = np.arange(19) - 9.5
     K = np.sum(weights * hist_19_matrix, axis=1)
     
     denom = 6.65 * target_slopes - 9.5
-    # 분모 0 수렴 방지
     denom[np.abs(denom) < 0.01] = np.sign(denom[np.abs(denom) < 0.01]) * 0.01 + 1e-9
     
     raw_prices = K / denom
     last_prices = hist_19_matrix[:, -1]
     
-    # 상하한가 30% 룰 적용 (기형적 역산값 방어)
     return np.clip(raw_prices, last_prices * 0.7, last_prices * 1.3)
+
+# 🌟 1일 단일 역산 (오늘 기준 미래 시뮬레이션용 - 누락 복구됨!)
+def reverse_calculate_price(prev_19_prices, target_slope_pct):
+    K = np.sum((np.arange(19) - 9.5) * prev_19_prices)
+    denom = 6.65 * target_slope_pct - 9.5
+    
+    if abs(denom) < 0.01:
+        denom = -0.01 if denom < 0 else 0.01
+        
+    raw_price = K / denom
+    last_price = prev_19_prices[-1]
+    
+    return np.clip(raw_price, last_price * 0.7, last_price * 1.3)
 
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V25", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V25.1", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V25: AI 딥스캔 & 메타 추천기")
+st.title("🔮 The Quantum Oracle V25.1: AI 딥스캔 & 메타 추천기")
 st.markdown("""
 종목 코드만 입력하십시오. 기계가 과거 수백 일의 역사를 모조리 스캔하여 **가장 예측 적중률이 높았던 고유의 보유 기간(T)**을 발굴합니다.  
 또한, 메타 AI가 '오늘 당장의 시그마와 슬로프'를 분석하여 오늘 장세에 딱 맞는 최적의 매도 타이밍을 추천합니다.
@@ -75,7 +83,6 @@ with st.sidebar:
 @st.cache_data(show_spinner=False, ttl=3600)
 def deep_scan_and_meta_predict(ticker):
     try:
-        # 1. 데이터 로드 및 타임존 제거
         df_target = yf.download(ticker, start="2010-01-01", progress=False)
         df_vix = yf.download("^VIX", start="2010-01-01", progress=False)
         df_spx = yf.download("^GSPC", start="2010-01-01", progress=False)
@@ -104,7 +111,6 @@ def deep_scan_and_meta_predict(ticker):
         n_days = len(closes)
         if n_days < 500: return None, "과거 데이터 부족 (최소 500일 필요)."
 
-        # 2. 피처 엔지니어링 (XGBoost 용)
         X_20, X_m_20, X_v_20 = get_linear_params(20)
         X_60, X_m_60, X_v_60 = get_linear_params(60)
         
@@ -127,7 +133,6 @@ def deep_scan_and_meta_predict(ticker):
         
         features = ['Sigma_20', 'Slope_20', 'Slope_60', 'Slope_Accel', 'Slope_Divergence', 'VIX_Change']
         
-        # 최근 20일은 검증 시 미래 가격이 없으므로 학습/백테스트에서 제외, 마지막 날은 '오늘'로 분리
         today_row = df.iloc[-1]
         ml_df = df.dropna(subset=features + ['Target_Slope_Next']).copy()
         
@@ -141,64 +146,50 @@ def deep_scan_and_meta_predict(ticker):
         model_slope.fit(X_scaled, Y_slope)
 
         # ---------------------------------------------------------
-        # 🌟 [초고속 텐서 백테스트] 과거 400일간 1~20일 역산 시뮬레이션
+        # 🌟 초고속 텐서 백테스트 (오타 수정 완료)
         # ---------------------------------------------------------
-        # 최근 20일(미래 정답이 없는 구간)을 제외한 뒤에서 400일 추출
         eval_df = ml_df.iloc[-420:-20].copy()
         N_eval = len(eval_df)
         
-        error_matrix = np.zeros((N_eval, 20)) # 400일 x 20일(T)
-        
-        # 초기 상태 행렬(Matrix) 구축
+        error_matrix = np.zeros((N_eval, 20)) 
         curr_state_matrix = eval_df[features].values 
         
-        # 각 날짜별 과거 20일 가격 히스토리 구축 (N_eval, 20)
         hist_idx = [np.where(df.index == d)[0][0] for d in eval_df.index]
         hist_prices_matrix = np.array([closes[idx-19 : idx+1] for idx in hist_idx])
         
-        # 20 스텝 (T=1~20) 벡터화 연쇄 시뮬레이션
         for step in range(20):
             x_in_scaled = scaler.transform(curr_state_matrix)
             next_slopes = model_slope.predict(x_in_scaled)
             
-            # 수학적 역산 (배열 연산으로 한 번에 계산)
             prev_19 = hist_prices_matrix[:, -19:]
             next_prices = vectorized_reverse_price(prev_19, next_slopes)
             
-            # 히스토리에 새 가격 추가 (창 밀어내기)
-            hist_prices_matrix = np.column_scaling = np.hstack((hist_prices_matrix[:, 1:], next_prices.reshape(-1, 1)))
+            # 🌟 치명적 오타 수정 완료 (np.column_scaling 제거)
+            hist_prices_matrix = np.hstack((hist_prices_matrix[:, 1:], next_prices.reshape(-1, 1)))
             
-            # 정답지 비교 (각 날짜별 step+1일 뒤 실제 주가)
             actual_future_prices = np.array([closes[idx + step + 1] for idx in hist_idx])
             errors = np.abs(next_prices - actual_future_prices) / actual_future_prices * 100
             error_matrix[:, step] = errors
             
-            # 다음 턴을 위한 상태 업데이트
             curr_state_matrix[:, features.index('Slope_Accel')] = next_slopes - curr_state_matrix[:, features.index('Slope_20')]
             curr_state_matrix[:, features.index('Slope_20')] = next_slopes
-            curr_state_matrix[:, features.index('Sigma_20')] *= 0.9 # 시그마 평균 회귀
+            curr_state_matrix[:, features.index('Sigma_20')] *= 0.9 
 
         # ---------------------------------------------------------
-        # 🧠 메타 모델 학습 (어떤 상황에서 어떤 T가 유리한가?)
+        # 🧠 메타 모델 학습
         # ---------------------------------------------------------
-        # 전체 400일 평균 오차를 바탕으로 패시브(전체 평균) 최적 T 추출
         mean_errors_per_t = np.mean(error_matrix, axis=0)
         passive_best_t = np.argmin(mean_errors_per_t) + 1
         
-        # 각 날짜별 가장 오차가 적었던 T 추출
         best_t_labels = np.argmin(error_matrix, axis=1) + 1
         
-        # 메타 모델: 입력값(진입일의 시그마, 슬로프) -> 출력값(최적 T)
         meta_features = eval_df[['Sigma_20', 'Slope_20']].values
         meta_clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
         meta_clf.fit(meta_features, best_t_labels)
         
-        # 오늘(현재)의 상태 분석
         today_sigma = today_row['Sigma_20']
         today_slope = today_row['Slope_20']
         active_best_t = meta_clf.predict([[today_sigma, today_slope]])[0]
-        
-        # 메타 모델의 신뢰도(해당 클래스 확률) 측정
         meta_prob = np.max(meta_clf.predict_proba([[today_sigma, today_slope]])) * 100
 
         # ---------------------------------------------------------
@@ -214,6 +205,7 @@ def deep_scan_and_meta_predict(ticker):
             x_in = scaler.transform([[today_state[f] for f in features]])
             next_slope = model_slope.predict(x_in)[0]
             
+            # 🌟 복구된 단일 역산 함수 호출
             next_price = reverse_calculate_price(np.array(today_hist[-19:]), next_slope)
             
             c_date += BDay(1)
@@ -225,7 +217,6 @@ def deep_scan_and_meta_predict(ticker):
             today_state['Slope_20'] = next_slope
             today_state['Sigma_20'] *= 0.9
 
-        # 최근 20일 과거 궤적 (그래프 연결용)
         past_dates = df.index[-20:].tolist()
         past_prices = closes[-20:].tolist()
 
@@ -274,7 +265,6 @@ if run_btn:
         
         st.markdown("---")
         
-        # --- 전체 T 랭킹 ---
         st.subheader("📊 3. 보유기간(T)별 예측 오차율 랭킹")
         rank_df = pd.DataFrame({
             'T (보유 일수)': [f"{i+1}일" for i in range(20)],
@@ -289,19 +279,16 @@ if run_btn:
         
         st.markdown("---")
         
-        # --- 미래 투영 궤적 ---
         st.subheader(f"📈 4. 오늘 기준: 20일 향후 역산 궤적 (Forward Projection)")
         st.markdown("> 과거 20일의 흐름을 이어받아, AI가 역산해 낸 **'순수 미래 20일'**의 점선 궤적입니다.")
         
         fig_proj = go.Figure()
         
-        # 과거 20일 실제 데이터
         fig_proj.add_trace(go.Scatter(
             x=res['past_dates'], y=res['past_prices'], mode='lines+markers',
             line=dict(color='#2c3e50', width=4), name='과거 20일 실제 주가'
         ))
         
-        # 미래 20일 예측 데이터 (과거 마지막 점과 연결)
         conn_dates = [res['past_dates'][-1]] + res['sim_dates']
         conn_prices = [res['past_prices'][-1]] + res['sim_prices']
         
@@ -310,7 +297,6 @@ if run_btn:
             line=dict(color='#e74c3c', width=3, dash='dot'), name='역산 기반 미래 궤적'
         ))
         
-        # 추천 매도일 마킹
         rec_idx = res['active_t'] - 1
         fig_proj.add_vline(x=res['sim_dates'][rec_idx], line_dash="dash", line_color="green", 
                            annotation_text=f"AI 액티브 타겟 (T={res['active_t']})")
