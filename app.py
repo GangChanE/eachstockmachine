@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ---------------------------------------------------------
 def round_to_tick(price, up=False):
     if price is None or np.isnan(price) or price <= 0: return 0
-    if price > 1e9: return int(price) # 비정상 폭등 시 예외 처리
+    if price > 1e9: return int(price)
     
     if price < 2000: tick = 1
     elif price < 5000: tick = 5
@@ -32,12 +32,12 @@ def round_to_tick(price, up=False):
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V12", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V13", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V12: 몬테카를로 & 로그 스케일 검증")
+st.title("🔮 The Quantum Oracle V13: 타임머신 & 실전 궤적 검증")
 st.markdown("""
-과거 데이터를 기반으로 **1,000번의 몬테카를로 시뮬레이션(평행우주)**을 돌려, 장세가 자유롭게 전환되는 완벽한 지수적(Exponential) 주가 궤적을 그립니다.  
-과거 시점으로 타임머신을 타고 들어가 예측 밴드와 실제 시장의 흐름을 비교해 보세요.
+**1. 시계열 가중치(EWMA):** 최근 시장의 기세(모멘텀)에 높은 가중치를 주어 밋밋한 평균의 함정을 극복했습니다.  
+**2. 장세 피로도(Hazard Rate):** 장세가 길어질수록 붕괴 확률을 높여, 비현실적인 영구 상승/하락 폭발을 방지합니다.
 """)
 
 with st.sidebar:
@@ -47,14 +47,14 @@ with st.sidebar:
     entry_price = st.number_input("기준일 매수 단가 (원)", value=0.0, step=1000.0)
     tax_rate = st.number_input("세율 적용 (%)", value=0.0, step=1.0) / 100.0
     fee = 0.003
-    use_log_scale = st.checkbox("📈 Y축 로그 스케일(Log Scale) 적용", value=False, help="복리로 팽창하는 궤적을 직선적 비율로 교정하여 봅니다.")
-    run_btn = st.button("🚀 1,000회 몬테카를로 검증 시작", type="primary")
+    use_log_scale = st.checkbox("📈 Y축 로그 스케일 적용", value=False)
+    run_btn = st.button("🚀 피로도 반영 몬테카를로 가동", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. 핵심 분석 엔진 (Monte Carlo + Markov Chain)
+# ⚙️ 2. 핵심 분석 엔진 (EWMA + Hazard Markov + GBM)
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
+def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
     try:
         raw = yf.download(ticker, start="2014-01-01", progress=False)
         if raw.empty: return None, "데이터 로드 실패."
@@ -96,7 +96,6 @@ def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
             s60, _, _, _, _ = linregress(x60, y60)
             if closes[i] > 0: ann_slopes60[i] = (s60 / closes[i]) * 100 * 252
 
-        # 🚦 1. 장세 분류
         REGIME_NAMES = ['Strong Bull', 'Bull', 'Random', 'Bear', 'Strong Bear']
         regimes = np.full(n_days, 'Random', dtype=object)
         regimes[ann_slopes60 >= 40] = 'Strong Bull'
@@ -110,45 +109,56 @@ def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
         cur_slope = slopes20[-1]
         cur_price = closes[-1]
         
-        # 📊 2. 라플라스 스무딩이 적용된 전이 행렬 구축
+        # 🌟 1. 최신 시장 가중치 부여 (EWMA - Half life 252일)
+        hl = 252.0
+        decay = np.log(2) / hl
+        weights = np.exp(-decay * np.arange(n_days-1, -1, -1)) # 최근일수록 가중치 1에 수렴
+
+        # 📊 2. 가중치가 적용된 전이 행렬 (최근 흐름 반영)
+        trans_matrix = {r1: {r2: 0.05 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES} # Laplace Smoothing
+        
         regime_blocks = []
         curr_r = regimes[win60]
         start_idx = win60
-        for i in range(win60 + 1, n_days):
-            if regimes[i] != curr_r:
-                regime_blocks.append({'regime': curr_r, 'duration': i - start_idx})
-                curr_r = regimes[i]
-                start_idx = i
-        regime_blocks.append({'regime': curr_r, 'duration': n_days - start_idx})
         
-        # Laplace Smoothing (+0.1) : 절대 고착되지 않음
-        trans_matrix = {r1: {r2: 0.1 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES}
-        for i in range(len(regime_blocks) - 1):
-            r_from = regime_blocks[i]['regime']
-            r_to = regime_blocks[i+1]['regime']
+        for i in range(win60, n_days - 1):
+            r_from = regimes[i]
+            r_to = regimes[i+1]
             if r_from in trans_matrix and r_to in trans_matrix:
-                trans_matrix[r_from][r_to] += 1
+                trans_matrix[r_from][r_to] += weights[i] # 빈도 대신 가중치 합산
+                
+            if regimes[i+1] != curr_r:
+                regime_blocks.append({'regime': curr_r, 'duration': i + 1 - start_idx})
+                curr_r = regimes[i+1]
+                start_idx = i + 1
+        regime_blocks.append({'regime': curr_r, 'duration': n_days - start_idx})
                 
         for r1 in REGIME_NAMES:
             total = sum(trans_matrix[r1].values())
             for r2 in REGIME_NAMES: trans_matrix[r1][r2] /= total
 
+        # 🌟 3. 장세별 통계 계산 (가중 평균 및 피로도 한계치 산출)
         regime_stats = {}
         for r in REGIME_NAMES:
-            r_blocks = [b for b in regime_blocks if b['regime'] == r]
-            avg_dur = np.mean([b['duration'] for b in r_blocks]) if r_blocks else 20
-            
             r_indices = np.where(regimes == r)[0]
-            log_rets = []
-            for idx in r_indices:
-                if idx + 1 < n_days and closes[idx] > 0 and closes[idx+1] > 0: 
-                    log_rets.append(np.log(closes[idx+1] / closes[idx]))
-                    
-            mu = np.mean(log_rets) if log_rets else 0.0     
-            sigma = np.std(log_rets) if log_rets else 0.02  
-            regime_stats[r] = {'avg_dur': max(3, int(avg_dur)), 'mu': mu, 'sigma': sigma}
+            valid_idx = [i for i in r_indices if i+1 < n_days and closes[i] > 0 and closes[i+1] > 0]
+            
+            if len(valid_idx) > 0:
+                log_rets = np.log(closes[np.array(valid_idx)+1] / closes[np.array(valid_idx)])
+                w = weights[valid_idx]
+                mu = np.average(log_rets, weights=w)
+                variance = np.average((log_rets - mu)**2, weights=w)
+                sigma = np.sqrt(variance)
+            else:
+                mu, sigma = 0.0, 0.02
+                
+            r_blocks = [b['duration'] for b in regime_blocks if b['regime'] == r]
+            # 피로도 한계선: 과거 해당 장세 수명의 95% 백분위수
+            max_dur = np.percentile(r_blocks, 95) if len(r_blocks) > 2 else 20
+            
+            regime_stats[r] = {'mu': mu, 'sigma': sigma, 'max_dur': max(5, int(max_dur))}
 
-        # 📈 3. 몬테카를로 시뮬레이션 (1,000 평행우주 생성)
+        # 📈 4. 해저드율(Hazard Rate)이 결합된 몬테카를로 시뮬레이션
         n_sim = 1000
         days_ahead = 360
         sim_prices = np.zeros((n_sim, days_ahead))
@@ -158,26 +168,46 @@ def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
         
         for i in range(n_sim):
             c_r = current_regime if current_regime in REGIME_NAMES else 'Random'
-            r_d = max(1, regime_stats[c_r]['avg_dur'] - last_block['duration'] + np.random.randint(-2, 3))
-            
+            run_duration = last_block['duration']
             price = cur_price
+            
             for t in range(days_ahead):
-                if r_d <= 0:
-                    probs = [trans_matrix[c_r][nxt] for nxt in REGIME_NAMES]
-                    probs = np.array(probs) / sum(probs)
-                    c_r = np.random.choice(REGIME_NAMES, p=probs)
-                    mean_dur = regime_stats[c_r]['avg_dur']
-                    r_d = max(3, int(np.random.normal(mean_dur, mean_dur * 0.2)))
+                # 🛡️ 피로도(Fatigue) 기반 확률 조정 로직
+                base_probs = {nxt: trans_matrix[c_r][nxt] for nxt in REGIME_NAMES}
+                max_d = regime_stats[c_r]['max_dur']
                 
+                # 수명이 한계치에 다가갈수록 피로도 지수 급증 (최대 0.95)
+                fatigue = min(0.95, (run_duration / max_d) ** 2)
+                
+                stay_prob = base_probs[c_r]
+                new_stay_prob = stay_prob * (1 - fatigue)
+                diff = stay_prob - new_stay_prob
+                
+                base_probs[c_r] = new_stay_prob
+                # 이탈한 확률을 시장을 진정시키는 방향으로 분배
+                if c_r != 'Random':
+                    base_probs['Random'] += diff # 추세가 길어지면 횡보장으로 회귀 강제
+                else:
+                    base_probs['Bear'] += diff / 2
+                    base_probs['Bull'] += diff / 2
+                    
+                probs_arr = [base_probs[nxt] for nxt in REGIME_NAMES]
+                probs_arr = np.array(probs_arr) / sum(probs_arr)
+                
+                next_r = np.random.choice(REGIME_NAMES, p=probs_arr)
+                
+                if next_r == c_r: run_duration += 1
+                else: 
+                    c_r = next_r
+                    run_duration = 1
+                    
+                # 기하 브라운 운동 (GBM) 진행
                 mu = regime_stats[c_r]['mu']
                 sig = regime_stats[c_r]['sigma']
-                
-                # 순수 기하 브라운 운동 (지수적 폭발 구현)
                 price *= np.exp(np.random.normal(mu, sig))
                 sim_prices[i, t] = price
-                r_d -= 1
 
-        # 백분위수 추출
+        # 결과 백분위수 추출
         low_90_arr = np.percentile(sim_prices, 5, axis=0)
         high_90_arr = np.percentile(sim_prices, 95, axis=0)
         center_arr = np.percentile(sim_prices, 50, axis=0)
@@ -196,7 +226,7 @@ def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 'High90': round_to_tick(high_90_arr[t], up=True)
             })
 
-        # 검증용 실제 데이터
+        # 검증용 실제 미래 데이터
         actual_future_dates = []
         actual_future_prices = []
         if not df_future.empty:
@@ -204,7 +234,7 @@ def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
             actual_future_dates = df_future_cut.index.tolist()
             actual_future_prices = df_future_cut['Close'].tolist()
 
-        # 🎯 4. 듀얼 코어 백테스트
+        # 🎯 5. 듀얼 코어 백테스트 (현재 조건 유지)
         c_ent_p = np.round(-cur_sigma, 1) 
         DROP_RANGE = np.round(np.arange(0.1, 5.1, 0.1), 1)
         EXT_RANGE = np.round(np.arange(-1.0, 5.1, 0.1), 1)
@@ -279,20 +309,18 @@ def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 1,000개의 평행우주를 생성하여 지수적 주가 궤적을 연산 중입니다..."):
-        res, err = run_monte_carlo_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
+    with st.spinner(f"📦 최근 장세에 가중치(EWMA)를 부여하고, 피로도(Hazard)가 반영된 1,000회 시뮬레이션을 가동 중입니다..."):
+        res, err = run_v13_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ 연산 완료!")
+        st.success(f"✅ V13 정밀 분석 완료! (분석 기준일: {target_date})")
         
         st.subheader("📈 1. 1,000회 몬테카를로 360일 지수 궤적 vs 실제 주가")
         
         if use_log_scale:
-            st.info("ℹ️ **로그 스케일(Log Scale) 모드 활성화됨:** 복리로 폭발하는 궤적의 비율적 대칭성이 수학적으로 직관화되어 보입니다.")
-        else:
-            st.info("ℹ️ **선형 스케일(Linear Scale) 모드 활성화됨:** 주가의 지수적 팽창(우측 꼬리 솟구침)이 시각적으로 과장되어 나타날 수 있습니다.")
+            st.info("ℹ️ **로그 스케일(Log Scale):** 폭발적인 지수 곡선이 안정적인 비율로 교정되어 보입니다.")
             
         traj_df = pd.DataFrame(res['trajectory'])
         fig = go.Figure()
@@ -304,7 +332,6 @@ if run_btn:
         if res['actual_dates'] and len(res['actual_dates']) > 0:
             fig.add_trace(go.Scatter(x=res['actual_dates'], y=res['actual_prices'], mode='lines', line=dict(color='black', width=3), name='실제 시장 흐름 (Reality)'))
             
-        # 🌟 로그 스케일 토글 반영 
         if use_log_scale:
             fig.update_layout(yaxis_type="log")
             
