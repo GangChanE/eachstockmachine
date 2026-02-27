@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import linregress
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import uniform_filter1d, uniform_filter
 from pandas.tseries.offsets import BDay
 import plotly.graph_objects as go
 import math
@@ -17,7 +17,6 @@ warnings.filterwarnings('ignore')
 def round_to_tick(price, up=False):
     if price is None or np.isnan(price) or price <= 0: return 0
     if price > 1e9: return int(price)
-    
     if price < 2000: tick = 1
     elif price < 5000: tick = 5
     elif price < 20000: tick = 10
@@ -25,7 +24,6 @@ def round_to_tick(price, up=False):
     elif price < 200000: tick = 100
     elif price < 500000: tick = 500
     else: tick = 1000
-        
     if up: return math.ceil(price / tick) * tick
     else: return math.floor(price / tick) * tick
 
@@ -45,12 +43,12 @@ def calc_fast_sigma(prices_20):
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V16", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V17", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V16: 오버래핑 T-Step 네트워크")
+st.title("🔮 The Quantum Oracle V17: 야생의 변동성 복원 (Brownian Bridge)")
 st.markdown("""
-T일의 간격을 보간법(가짜 데이터)으로 채우지 않습니다.  
-**T개의 독립된 평행우주 그룹(3K, 3K-1...)을 동시에 진행시키며, 서로의 시그마를 상호 참조(Cross-Reference)하는 가장 고도화된 연쇄 복리 예측망**을 구성합니다.
+밋밋한 선형 보간을 폐기하고 **[브라운 브릿지(Brownian Bridge)]** 수학 모델을 도입했습니다.  
+T일 뒤의 거시적 목표(도착점)를 향해 나아가면서도, 일일 변동성(Daily Volatility)이 살아 숨 쉬는 완벽히 현실적인 궤적을 그립니다.
 """)
 
 with st.sidebar:
@@ -61,13 +59,13 @@ with st.sidebar:
     tax_rate = st.number_input("세율 적용 (%)", value=0.0, step=1.0) / 100.0
     fee = 0.003
     use_log_scale = st.checkbox("📈 Y축 로그 스케일 적용", value=False)
-    run_btn = st.button("🚀 오버래핑 몬테카를로 가동", type="primary")
+    run_btn = st.button("🚀 브라운 브릿지 몬테카를로 가동", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. 핵심 분석 엔진 (위상 교차 T-Step 모델)
+# ⚙️ 2. 핵심 분석 엔진 (Brownian Bridge + T-Step)
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
+def run_v17_oracle(ticker, target_date, ent_price, tax, fee_rate):
     try:
         raw = yf.download(ticker, start="2014-01-01", progress=False)
         if raw.empty: return None, "데이터 로드 실패."
@@ -117,14 +115,22 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
         cur_slope = slopes20[-1]
         cur_price = closes[-1]
         
-        # 🌟 1. 장세별 최적 T일 및 예상 수익률 회귀 함수 도출
+        # 🌟 1. 장세별 일일 변동성(Daily Volatility) 추출 (브릿지용)
+        daily_vol_dict = {}
         regime_models = {}
         for r in REGIME_NAMES:
             r_indices = np.where(regimes == r)[0]
             if len(r_indices) < 50: 
-                regime_models[r] = {'T': 5, 'slope': 0, 'inter': 0, 'res_std': 0.02}
+                regime_models[r] = {'T': 5, 'slope': 0, 'inter': 0, 'res_std': 0.05}
+                daily_vol_dict[r] = 0.02
                 continue
-                
+            
+            # 일일 변동성 계산
+            log_rets = []
+            for i in r_indices:
+                if i+1 < n_days and closes[i] > 0: log_rets.append(np.log(closes[i+1]/closes[i]))
+            daily_vol_dict[r] = np.std(log_rets) if log_rets else 0.02
+
             max_t = 30
             t_corrs = []
             for t in range(1, max_t + 1):
@@ -132,12 +138,11 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 for i in r_indices:
                     if i + t < n_days:
                         x_sig.append(sigmas[i])
-                        # 복리 계산을 위한 지수형 추적
                         y_ret.append((closes[i+t] / closes[i]) - 1.0)
                 if len(x_sig) > 30: t_corrs.append(np.corrcoef(x_sig, y_ret)[0, 1])
                 else: t_corrs.append(0)
             
-            best_t = np.argmin(uniform_filter(t_corrs, size=3)) + 1 
+            best_t = np.argmin(uniform_filter1d(t_corrs, size=3)) + 1 
             
             x_sig, y_ret = [], []
             for i in r_indices:
@@ -149,7 +154,7 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 s, inter, _, _, _ = linregress(x_sig, y_ret)
                 res_std = np.std(np.array(y_ret) - (s * np.array(x_sig) + inter))
             else:
-                s, inter, res_std = 0, 0, 0.02
+                s, inter, res_std = 0, 0, 0.05
                 
             regime_models[r] = {'T': best_t, 'slope': s, 'inter': inter, 'res_std': res_std}
 
@@ -159,51 +164,66 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
             tot = sum(trans_matrix[r1].values())
             for r2 in REGIME_NAMES: trans_matrix[r1][r2] /= tot
 
-        # 📈 2. 오버래핑 T-Step 몬테카를로 시뮬레이션
+        # 📈 2. Brownian Bridge 결합 T-Step 몬테카를로
         n_sim = 1000
         days_ahead = 360
         sim_prices = np.zeros((n_sim, days_ahead))
         
         np.random.seed()
         
-        # 최적 T를 현재 장세 기준으로 고정 (연산 기준점)
-        sim_T = regime_models[current_regime]['T']
-        
         for i in range(n_sim):
             c_r = current_regime
-            # 상호 참조 시그마를 위한 과거 히스토리 배열 복사 (충분한 길이 T + 20)
-            hist = list(closes[-(win20 + sim_T):]) 
-            path = []
+            hist = list(closes[-win20:]) # 초기 역사
             
-            for t in range(days_ahead):
+            day_idx = 0
+            while day_idx < days_ahead:
                 probs = [trans_matrix[c_r][nxt] for nxt in REGIME_NAMES]
                 c_r = np.random.choice(REGIME_NAMES, p=probs)
                 
                 model = regime_models[c_r]
+                T = model['T']
+                daily_vol = daily_vol_dict[c_r] # 해당 장세의 야생 변동성
                 
-                # 🌟 회원님의 핵심 로직: T일 전의 상태를 Base로 삼음
-                # 현재 시점(t)을 예측하기 위해 필요한 시그마는 T일 전(t-sim_T) 시점의 20일 기록
-                base_idx_in_hist = len(hist) - sim_T
-                prices_for_sigma = hist[base_idx_in_hist - win20 : base_idx_in_hist]
+                # 시그마 피드백 계산
+                current_sim_sigma = calc_fast_sigma(np.array(hist[-20:]))
                 
-                base_sigma = calc_fast_sigma(np.array(prices_for_sigma))
-                
-                expected_ret = model['slope'] * base_sigma + model['inter']
+                # T일 뒤 목표가 설정
+                expected_ret = model['slope'] * current_sim_sigma + model['inter']
                 realized_ret = expected_ret + np.random.normal(0, model['res_std'])
                 
-                # T일 전 가격 * (1 + T일 수익률)
-                base_price = hist[base_idx_in_hist - 1] 
-                next_price = max(0.1, base_price * (1 + realized_ret))
+                start_p = hist[-1]
+                target_p = max(0.1, start_p * (1 + realized_ret))
                 
-                hist.append(next_price)
-                path.append(next_price)
+                # 🌟 Brownian Bridge 알고리즘 (야생의 변동성을 살리며 도착점에 꽂힘)
+                # 로그 스케일로 다리(Bridge) 건설
+                log_start = np.log(start_p)
+                log_target = np.log(target_p)
+                
+                bridge_prices = []
+                for step in range(1, T + 1):
+                    if step == T:
+                        bridge_prices.append(target_p)
+                    else:
+                        # 브라운 브릿지 공식: 남은 거리의 선형 비율 + 무작위 진동(Volatility)
+                        time_ratio = step / T
+                        mean_log_p = log_start + time_ratio * (log_target - log_start)
+                        
+                        # 도착지점에 가까울수록 분산이 0으로 수렴하는 구조 (Tie-down)
+                        bridge_var = (step * (T - step) / T) * (daily_vol ** 2)
+                        bridge_std = np.sqrt(bridge_var) if bridge_var > 0 else 0
+                        
+                        sim_log_p = np.random.normal(mean_log_p, bridge_std)
+                        bridge_prices.append(np.exp(sim_log_p))
+                
+                for bp in bridge_prices:
+                    if day_idx < days_ahead:
+                        sim_prices[i, day_idx] = bp
+                        hist.append(bp)
+                        day_idx += 1
+                    else:
+                        break
 
-            # 🛠️ 보정 장치: 톱니바퀴 간극(Divergence) 해소를 위한 T일 이동평균 결합
-            path_series = pd.Series(path)
-            smoothed_path = path_series.rolling(window=sim_T, min_periods=1).mean().values
-            sim_prices[i, :] = smoothed_path
-
-        # 📊 3. 다중 백분위수 (Fan Chart) 추출
+        # 📊 3. 다중 백분위수 (Fan Chart)
         low_90 = np.percentile(sim_prices, 5, axis=0)
         high_90 = np.percentile(sim_prices, 95, axis=0)
         low_80 = np.percentile(sim_prices, 10, axis=0)
@@ -227,7 +247,6 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 'Low70': round_to_tick(low_70[t], up=False), 'High70': round_to_tick(high_70[t], up=True)
             })
 
-        # 검증용 실제 미래 데이터
         actual_future_dates = []
         actual_future_prices = []
         if not df_future.empty:
@@ -235,7 +254,7 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
             actual_future_dates = df_future_cut.index.tolist()
             actual_future_prices = df_future_cut['Close'].tolist()
 
-        # 🎯 4. 듀얼 코어 백테스트 (현재 상태 유지)
+        # 🎯 4. 듀얼 코어 백테스트 (현재 유지)
         c_ent_p = np.round(-cur_sigma, 1) 
         DROP_RANGE = np.round(np.arange(0.1, 5.1, 0.1), 1)
         EXT_RANGE = np.round(np.arange(-1.0, 5.1, 0.1), 1)
@@ -297,7 +316,6 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
 
         res = {
             'curr_regime': display_curr, 'cur_sigma': cur_sigma, 'cur_price': cur_price, 'cur_slope': cur_slope,
-            'model_t': sim_T,
             'trajectory': trajectory, 'dual_results': dual_results,
             'actual_dates': actual_future_dates, 'actual_prices': actual_future_prices,
             'my_profit': ((cur_price / ent_price) - 1.0) * 100 if ent_price > 0 else 0.0
@@ -311,36 +329,31 @@ def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 위상 교차(Interleaved) T-Step 복리 모델을 가동 중입니다..."):
-        res, err = run_v16_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
+    with st.spinner(f"📦 변동성(Volatility)을 복원한 브라운 브릿지 시뮬레이션 가동 중..."):
+        res, err = run_v17_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ 오버래핑 몬테카를로 분석 완료! (현재 장세 최적 주기: T={res['model_t']}일)")
+        st.success(f"✅ 야생의 변동성 복원 완료! (분석 기준일: {target_date})")
         
         st.subheader("📈 1. 다중 위상 궤적(Fan Chart) vs 실제 주가")
-        st.markdown(f"> 회원님의 **[T일 독립 그룹 릴레이 논리]**를 적용했습니다. 톱니바퀴 간극을 이동평균으로 꿰매어 완벽한 복리 곡선을 연출합니다.")
+        st.markdown("> 인위적인 이동평균(Smoothing)을 제거하고, **브라운 브릿지(Brownian Bridge)** 수학 모델을 통해 일일 변동성이 펄떡이는 가장 현실적인 확률 밴드를 도출했습니다.")
         
         traj_df = pd.DataFrame(res['trajectory'])
         fig = go.Figure()
         
-        # 90% 밴드
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High90'], mode='lines', line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low90'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.1)', name='90% 확률 구간'))
 
-        # 80% 밴드
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High80'], mode='lines', line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low80'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.25)', name='80% 확률 구간'))
 
-        # 70% 밴드
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High70'], mode='lines', line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low70'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.4)', name='70% 확률 구간'))
 
-        # 중심가
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Center'], mode='lines', line=dict(color='#e74c3c', width=2, dash='dot'), name='예상 중심가', hovertemplate="<b>%{x|%Y-%m-%d}</b><br>예상가: ₩%{y:,.0f}<extra></extra>"))
         
-        # 실제 데이터
         if res['actual_dates'] and len(res['actual_dates']) > 0:
             fig.add_trace(go.Scatter(x=res['actual_dates'], y=res['actual_prices'], mode='lines', line=dict(color='black', width=3), name='실제 시장 흐름 (Reality)'))
             
