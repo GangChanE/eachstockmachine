@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 호가 교정 함수
+# ⚙️ 0. 고속 연산 및 호가 교정 함수
 # ---------------------------------------------------------
 def round_to_tick(price, up=False):
     if price is None or np.isnan(price) or price <= 0: return 0
@@ -29,15 +29,28 @@ def round_to_tick(price, up=False):
     if up: return math.ceil(price / tick) * tick
     else: return math.floor(price / tick) * tick
 
+X_ARR = np.arange(20)
+X_MEAN = 9.5
+X_VAR_SUM = 665.0 
+
+def calc_fast_sigma(prices_20):
+    y_mean = np.mean(prices_20)
+    slope = np.sum((X_ARR - X_MEAN) * (prices_20 - y_mean)) / X_VAR_SUM
+    intercept = y_mean - slope * X_MEAN
+    trend_line = slope * X_ARR + intercept
+    std = np.std(prices_20 - trend_line)
+    if std > 0: return (prices_20[-1] - trend_line[-1]) / std
+    return 0.0
+
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V14", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V16", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V14: 다중 확률 밴드(Fan Chart) 검증")
+st.title("🔮 The Quantum Oracle V16: 오버래핑 T-Step 네트워크")
 st.markdown("""
-1,000번의 몬테카를로 평행우주 시뮬레이션을 통해 미래 궤적을 예측합니다.  
-"예측"의 오만을 버리고, **70%, 80%, 90%의 다중 확률 구간(Confidence Intervals)**을 그라데이션으로 겹쳐 그려내어 어떠한 호재/악재에도 대응할 수 있는 거시적 지지/저항 라인을 시각화합니다.
+T일의 간격을 보간법(가짜 데이터)으로 채우지 않습니다.  
+**T개의 독립된 평행우주 그룹(3K, 3K-1...)을 동시에 진행시키며, 서로의 시그마를 상호 참조(Cross-Reference)하는 가장 고도화된 연쇄 복리 예측망**을 구성합니다.
 """)
 
 with st.sidebar:
@@ -48,13 +61,13 @@ with st.sidebar:
     tax_rate = st.number_input("세율 적용 (%)", value=0.0, step=1.0) / 100.0
     fee = 0.003
     use_log_scale = st.checkbox("📈 Y축 로그 스케일 적용", value=False)
-    run_btn = st.button("🚀 다중 확률 궤적 몬테카를로 가동", type="primary")
+    run_btn = st.button("🚀 오버래핑 몬테카를로 가동", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. 핵심 분석 엔진 (다중 백분위수 추출 적용)
+# ⚙️ 2. 핵심 분석 엔진 (위상 교차 T-Step 모델)
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
+def run_v16_oracle(ticker, target_date, ent_price, tax, fee_rate):
     try:
         raw = yf.download(ticker, start="2014-01-01", progress=False)
         if raw.empty: return None, "데이터 로드 실패."
@@ -66,7 +79,6 @@ def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
         df_all = df_all[['Open', 'Close']].dropna()
         target_dt = pd.to_datetime(target_date)
         
-        # 🛡️ 데이터 분리
         df_past = df_all[df_all.index <= target_dt]
         df_future = df_all[df_all.index > target_dt]
         
@@ -86,14 +98,10 @@ def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
         x60 = np.arange(win60)
         
         for i in range(win60, n_days):
-            y20 = closes[i-win20:i]
-            s20, i20, _, _, _ = linregress(x20, y20)
-            std20 = np.std(y20 - (s20*x20 + i20))
-            if std20 > 0: sigmas[i] = (closes[i] - (s20*(win20-1)+i20)) / std20
+            sigmas[i] = calc_fast_sigma(closes[i-win20:i])
+            s20, _, _, _, _ = linregress(x20, closes[i-win20:i])
             if closes[i] > 0: slopes20[i] = (s20 / closes[i]) * 100
-            
-            y60 = closes[i-win60:i]
-            s60, _, _, _, _ = linregress(x60, y60)
+            s60, _, _, _, _ = linregress(x60, closes[i-win60:i])
             if closes[i] > 0: ann_slopes60[i] = (s60 / closes[i]) * 100 * 252
 
         REGIME_NAMES = ['Strong Bull', 'Bull', 'Random', 'Bear', 'Strong Bear']
@@ -109,100 +117,99 @@ def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
         cur_slope = slopes20[-1]
         cur_price = closes[-1]
         
-        # 🌟 1. 최신 시장 가중치 부여 (EWMA)
-        hl = 252.0
-        decay = np.log(2) / hl
-        weights = np.exp(-decay * np.arange(n_days-1, -1, -1)) 
-
-        # 📊 2. 가중치 적용 전이 행렬 (Laplace Smoothing 포함)
-        trans_matrix = {r1: {r2: 0.05 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES}
-        
-        regime_blocks = []
-        curr_r = regimes[win60]
-        start_idx = win60
-        
-        for i in range(win60, n_days - 1):
-            r_from = regimes[i]
-            r_to = regimes[i+1]
-            if r_from in trans_matrix and r_to in trans_matrix:
-                trans_matrix[r_from][r_to] += weights[i]
-                
-            if regimes[i+1] != curr_r:
-                regime_blocks.append({'regime': curr_r, 'duration': i + 1 - start_idx})
-                curr_r = regimes[i+1]
-                start_idx = i + 1
-        regime_blocks.append({'regime': curr_r, 'duration': n_days - start_idx})
-                
-        for r1 in REGIME_NAMES:
-            total = sum(trans_matrix[r1].values())
-            for r2 in REGIME_NAMES: trans_matrix[r1][r2] /= total
-
-        # 🌟 3. 장세별 통계 계산
-        regime_stats = {}
+        # 🌟 1. 장세별 최적 T일 및 예상 수익률 회귀 함수 도출
+        regime_models = {}
         for r in REGIME_NAMES:
             r_indices = np.where(regimes == r)[0]
-            valid_idx = [i for i in r_indices if i+1 < n_days and closes[i] > 0 and closes[i+1] > 0]
-            
-            if len(valid_idx) > 0:
-                log_rets = np.log(closes[np.array(valid_idx)+1] / closes[np.array(valid_idx)])
-                w = weights[valid_idx]
-                mu = np.average(log_rets, weights=w)
-                variance = np.average((log_rets - mu)**2, weights=w)
-                sigma = np.sqrt(variance)
-            else:
-                mu, sigma = 0.0, 0.02
+            if len(r_indices) < 50: 
+                regime_models[r] = {'T': 5, 'slope': 0, 'inter': 0, 'res_std': 0.02}
+                continue
                 
-            r_blocks = [b['duration'] for b in regime_blocks if b['regime'] == r]
-            max_dur = np.percentile(r_blocks, 95) if len(r_blocks) > 2 else 20
-            regime_stats[r] = {'mu': mu, 'sigma': sigma, 'max_dur': max(5, int(max_dur))}
+            max_t = 30
+            t_corrs = []
+            for t in range(1, max_t + 1):
+                x_sig, y_ret = [], []
+                for i in r_indices:
+                    if i + t < n_days:
+                        x_sig.append(sigmas[i])
+                        # 복리 계산을 위한 지수형 추적
+                        y_ret.append((closes[i+t] / closes[i]) - 1.0)
+                if len(x_sig) > 30: t_corrs.append(np.corrcoef(x_sig, y_ret)[0, 1])
+                else: t_corrs.append(0)
+            
+            best_t = np.argmin(uniform_filter(t_corrs, size=3)) + 1 
+            
+            x_sig, y_ret = [], []
+            for i in r_indices:
+                if i + best_t < n_days:
+                    x_sig.append(sigmas[i])
+                    y_ret.append((closes[i+best_t] / closes[i]) - 1.0)
+                    
+            if len(x_sig) > 2:
+                s, inter, _, _, _ = linregress(x_sig, y_ret)
+                res_std = np.std(np.array(y_ret) - (s * np.array(x_sig) + inter))
+            else:
+                s, inter, res_std = 0, 0, 0.02
+                
+            regime_models[r] = {'T': best_t, 'slope': s, 'inter': inter, 'res_std': res_std}
 
-        # 📈 4. 해저드율 + GBM 몬테카를로 시뮬레이션
+        trans_matrix = {r1: {r2: 0.1 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES}
+        for i in range(win60, n_days - 1): trans_matrix[regimes[i]][regimes[i+1]] += 1
+        for r1 in REGIME_NAMES:
+            tot = sum(trans_matrix[r1].values())
+            for r2 in REGIME_NAMES: trans_matrix[r1][r2] /= tot
+
+        # 📈 2. 오버래핑 T-Step 몬테카를로 시뮬레이션
         n_sim = 1000
         days_ahead = 360
         sim_prices = np.zeros((n_sim, days_ahead))
-        last_block = regime_blocks[-1]
         
         np.random.seed()
         
+        # 최적 T를 현재 장세 기준으로 고정 (연산 기준점)
+        sim_T = regime_models[current_regime]['T']
+        
         for i in range(n_sim):
-            c_r = current_regime if current_regime in REGIME_NAMES else 'Random'
-            run_duration = last_block['duration']
-            price = cur_price
+            c_r = current_regime
+            # 상호 참조 시그마를 위한 과거 히스토리 배열 복사 (충분한 길이 T + 20)
+            hist = list(closes[-(win20 + sim_T):]) 
+            path = []
             
             for t in range(days_ahead):
-                base_probs = {nxt: trans_matrix[c_r][nxt] for nxt in REGIME_NAMES}
-                max_d = regime_stats[c_r]['max_dur']
-                fatigue = min(0.95, (run_duration / max_d) ** 2)
+                probs = [trans_matrix[c_r][nxt] for nxt in REGIME_NAMES]
+                c_r = np.random.choice(REGIME_NAMES, p=probs)
                 
-                stay_prob = base_probs[c_r]
-                new_stay_prob = stay_prob * (1 - fatigue)
-                diff = stay_prob - new_stay_prob
+                model = regime_models[c_r]
                 
-                base_probs[c_r] = new_stay_prob
-                if c_r != 'Random': base_probs['Random'] += diff
-                else: 
-                    base_probs['Bear'] += diff / 2
-                    base_probs['Bull'] += diff / 2
-                    
-                probs_arr = [base_probs[nxt] for nxt in REGIME_NAMES]
-                probs_arr = np.array(probs_arr) / sum(probs_arr)
+                # 🌟 회원님의 핵심 로직: T일 전의 상태를 Base로 삼음
+                # 현재 시점(t)을 예측하기 위해 필요한 시그마는 T일 전(t-sim_T) 시점의 20일 기록
+                base_idx_in_hist = len(hist) - sim_T
+                prices_for_sigma = hist[base_idx_in_hist - win20 : base_idx_in_hist]
                 
-                next_r = np.random.choice(REGIME_NAMES, p=probs_arr)
-                if next_r == c_r: run_duration += 1
-                else: c_r, run_duration = next_r, 1
-                    
-                mu, sig = regime_stats[c_r]['mu'], regime_stats[c_r]['sigma']
-                price *= np.exp(np.random.normal(mu, sig))
-                sim_prices[i, t] = price
+                base_sigma = calc_fast_sigma(np.array(prices_for_sigma))
+                
+                expected_ret = model['slope'] * base_sigma + model['inter']
+                realized_ret = expected_ret + np.random.normal(0, model['res_std'])
+                
+                # T일 전 가격 * (1 + T일 수익률)
+                base_price = hist[base_idx_in_hist - 1] 
+                next_price = max(0.1, base_price * (1 + realized_ret))
+                
+                hist.append(next_price)
+                path.append(next_price)
 
-        # 📊 5. 다중 백분위수 (Fan Chart) 추출
-        # 90% (5~95), 80% (10~90), 70% (15~85)
-        low_90_arr = np.percentile(sim_prices, 5, axis=0)
-        high_90_arr = np.percentile(sim_prices, 95, axis=0)
-        low_80_arr = np.percentile(sim_prices, 10, axis=0)
-        high_80_arr = np.percentile(sim_prices, 90, axis=0)
-        low_70_arr = np.percentile(sim_prices, 15, axis=0)
-        high_70_arr = np.percentile(sim_prices, 85, axis=0)
+            # 🛠️ 보정 장치: 톱니바퀴 간극(Divergence) 해소를 위한 T일 이동평균 결합
+            path_series = pd.Series(path)
+            smoothed_path = path_series.rolling(window=sim_T, min_periods=1).mean().values
+            sim_prices[i, :] = smoothed_path
+
+        # 📊 3. 다중 백분위수 (Fan Chart) 추출
+        low_90 = np.percentile(sim_prices, 5, axis=0)
+        high_90 = np.percentile(sim_prices, 95, axis=0)
+        low_80 = np.percentile(sim_prices, 10, axis=0)
+        high_80 = np.percentile(sim_prices, 90, axis=0)
+        low_70 = np.percentile(sim_prices, 15, axis=0)
+        high_70 = np.percentile(sim_prices, 85, axis=0)
         center_arr = np.percentile(sim_prices, 50, axis=0)
         
         trajectory = []
@@ -215,9 +222,9 @@ def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
             trajectory.append({
                 'Date': pred_date,
                 'Center': round_to_tick(center_arr[t], up=False),
-                'Low90': round_to_tick(low_90_arr[t], up=False), 'High90': round_to_tick(high_90_arr[t], up=True),
-                'Low80': round_to_tick(low_80_arr[t], up=False), 'High80': round_to_tick(high_80_arr[t], up=True),
-                'Low70': round_to_tick(low_70_arr[t], up=False), 'High70': round_to_tick(high_70_arr[t], up=True)
+                'Low90': round_to_tick(low_90[t], up=False), 'High90': round_to_tick(high_90[t], up=True),
+                'Low80': round_to_tick(low_80[t], up=False), 'High80': round_to_tick(high_80[t], up=True),
+                'Low70': round_to_tick(low_70[t], up=False), 'High70': round_to_tick(high_70[t], up=True)
             })
 
         # 검증용 실제 미래 데이터
@@ -228,7 +235,7 @@ def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
             actual_future_dates = df_future_cut.index.tolist()
             actual_future_prices = df_future_cut['Close'].tolist()
 
-        # 🎯 6. 듀얼 코어 백테스트
+        # 🎯 4. 듀얼 코어 백테스트 (현재 상태 유지)
         c_ent_p = np.round(-cur_sigma, 1) 
         DROP_RANGE = np.round(np.arange(0.1, 5.1, 0.1), 1)
         EXT_RANGE = np.round(np.arange(-1.0, 5.1, 0.1), 1)
@@ -290,6 +297,7 @@ def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
 
         res = {
             'curr_regime': display_curr, 'cur_sigma': cur_sigma, 'cur_price': cur_price, 'cur_slope': cur_slope,
+            'model_t': sim_T,
             'trajectory': trajectory, 'dual_results': dual_results,
             'actual_dates': actual_future_dates, 'actual_prices': actual_future_prices,
             'my_profit': ((cur_price / ent_price) - 1.0) * 100 if ent_price > 0 else 0.0
@@ -303,47 +311,46 @@ def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 다중 확률(Fan Chart) 궤적을 연산 중입니다..."):
-        res, err = run_v14_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
+    with st.spinner(f"📦 위상 교차(Interleaved) T-Step 복리 모델을 가동 중입니다..."):
+        res, err = run_v16_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ Fan Chart 정밀 분석 완료! (분석 기준일: {target_date})")
+        st.success(f"✅ 오버래핑 몬테카를로 분석 완료! (현재 장세 최적 주기: T={res['model_t']}일)")
         
-        st.subheader("📈 1. 1,000회 몬테카를로: 다중 확률 밴드(Fan Chart) vs 실제 주가")
-        st.markdown("> **중심부일수록 확률 밀도가 높으며**, 어떠한 호재나 악재가 터져도 수학적으로 90% 안에 머물도록 밴드를 확장 설계했습니다.")
+        st.subheader("📈 1. 다중 위상 궤적(Fan Chart) vs 실제 주가")
+        st.markdown(f"> 회원님의 **[T일 독립 그룹 릴레이 논리]**를 적용했습니다. 톱니바퀴 간극을 이동평균으로 꿰매어 완벽한 복리 곡선을 연출합니다.")
         
         traj_df = pd.DataFrame(res['trajectory'])
         fig = go.Figure()
         
-        # 1. 90% 밴드 (가장 넓고 연함)
+        # 90% 밴드
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High90'], mode='lines', line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low90'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.1)', name='90% 확률 구간'))
 
-        # 2. 80% 밴드 (중간 넓이)
+        # 80% 밴드
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High80'], mode='lines', line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low80'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.25)', name='80% 확률 구간'))
 
-        # 3. 70% 밴드 (가장 좁고 진함)
+        # 70% 밴드
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High70'], mode='lines', line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low70'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.4)', name='70% 확률 구간'))
 
-        # 4. 예상 중심가 (점선)
-        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Center'], mode='lines', line=dict(color='#e74c3c', width=2, dash='dot'), name='예상 통계적 중심', hovertemplate="<b>%{x|%Y-%m-%d}</b><br>중심 예상가: ₩%{y:,.0f}<extra></extra>"))
+        # 중심가
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Center'], mode='lines', line=dict(color='#e74c3c', width=2, dash='dot'), name='예상 중심가', hovertemplate="<b>%{x|%Y-%m-%d}</b><br>예상가: ₩%{y:,.0f}<extra></extra>"))
         
-        # 5. 실제 시장 흐름 (검은 실선)
+        # 실제 데이터
         if res['actual_dates'] and len(res['actual_dates']) > 0:
             fig.add_trace(go.Scatter(x=res['actual_dates'], y=res['actual_prices'], mode='lines', line=dict(color='black', width=3), name='실제 시장 흐름 (Reality)'))
             
-        if use_log_scale:
-            fig.update_layout(yaxis_type="log")
+        if use_log_scale: fig.update_layout(yaxis_type="log")
             
         fig.update_layout(hovermode="x unified", height=500, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="미래 날짜", yaxis_title="주가 (원)")
         st.plotly_chart(fig, use_container_width=True)
         
         st.markdown("---")
-        st.subheader(f"🎯 2. 기준일({target_date}) 당시 듀얼 매도 전략 (당시 Sigma: {res['cur_sigma']:.2f})")
+        st.subheader(f"🎯 2. 기준일({target_date}) 듀얼 매도 전략 (당시 Sigma: {res['cur_sigma']:.2f})")
         
         dual = res['dual_results']
         c1, c2 = st.columns(2)
@@ -352,14 +359,14 @@ if run_btn:
             st.markdown("#### ⚡ [단기 스윙형] 엑시트")
             if dual['short']:
                 st.info(f"**목표 매도 구간**\n### ₩{dual['short']['target_min']:,} ~ ₩{dual['short']['target_max']:,}")
-                st.error(f"**생명선 이탈 기준**\n### 기울기 {dual['short']['cut_slope']:.2f}% (당시 {res['cur_slope']:.2f}%)")
+                st.error(f"**생명선 이탈 기준**\n### 기울기 {dual['short']['cut_slope']:.2f}%")
             else:
-                st.write("단기 스윙 데이터 부족.")
+                st.write("단기 데이터 부족.")
 
         with c2:
             st.markdown("#### 📦 [장기 추세형] 엑시트")
             if dual['long']:
                 st.success(f"**목표 매도 구간**\n### ₩{dual['long']['target_min']:,} ~ ₩{dual['long']['target_max']:,}")
-                st.error(f"**생명선 이탈 기준**\n### 기울기 {dual['long']['cut_slope']:.2f}% (당시 {res['cur_slope']:.2f}%)")
+                st.error(f"**생명선 이탈 기준**\n### 기울기 {dual['long']['cut_slope']:.2f}%")
             else:
-                st.write("장기 추세 데이터 부족.")
+                st.write("장기 데이터 부족.")
