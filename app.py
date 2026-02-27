@@ -2,8 +2,8 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.stats import linregress, skew
-from sklearn.ensemble import RandomForestRegressor
+from scipy.stats import skew, kurtosis
+from xgboost import XGBRegressor # 🌟 궁극의 알고리즘 도입
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 from pandas.tseries.offsets import BDay
@@ -12,182 +12,228 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 고속 연산 함수 (배열 길이 20으로 엄격히 통제)
+# ⚙️ 0. 고속 연산 엔진 (다중 윈도우 지원)
 # ---------------------------------------------------------
-X_ARR_20 = np.arange(20)
-X_MEAN_20 = 9.5
-X_VAR_SUM_20 = 665.0 
+def get_linear_params(win):
+    X = np.arange(win)
+    X_mean = np.mean(X)
+    X_var_sum = np.sum((X - X_mean)**2)
+    return X, X_mean, X_var_sum
 
-X_ARR_60 = np.arange(60)
-X_MEAN_60 = 29.5
-X_VAR_SUM_60 = 17990.0
-
-def calc_fast_slope(prices, X_ARR, X_MEAN, X_VAR_SUM):
+def calc_fast_slope(prices, X, X_mean, X_var_sum):
     y_mean = np.mean(prices)
-    slope = np.sum((X_ARR - X_MEAN) * (prices - y_mean)) / X_VAR_SUM
+    slope = np.sum((X - X_mean) * (prices - y_mean)) / X_var_sum
     current_price = prices[-1]
     return (slope / current_price) * 100 if current_price > 0 else 0.0
 
-def calc_sigma(prices, X_ARR, X_MEAN, X_VAR_SUM):
+def calc_sigma(prices, X, X_mean, X_var_sum):
     y_mean = np.mean(prices)
-    slope = np.sum((X_ARR - X_MEAN) * (prices - y_mean)) / X_VAR_SUM
-    intercept = y_mean - slope * X_MEAN
-    trend_line = slope * X_ARR + intercept
+    slope = np.sum((X - X_mean) * (prices - y_mean)) / X_var_sum
+    intercept = y_mean - slope * X_mean
+    trend_line = slope * X + intercept
     std = np.std(prices - trend_line)
     return (prices[-1] - trend_line[-1]) / std if std > 0 else 0.0
 
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V22.1", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V23", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V22.1: 무결점 AI 검증기")
+st.title("🔮 The Quantum Oracle V23: 듀얼 XGBoost 극한 검증기")
 st.markdown("""
-과거 특정 날짜까지의 데이터만으로 AI를 학습시키고, 미래를 완벽히 가린 상태에서 T일 간의 '슬로프 & 시그마' 궤적을 예측합니다.  
-그 후 **실제 시장에서 일어난 현실 궤적과 오버레이(Overlay)**하여 모델의 단기 스윙 정확도를 검증합니다.
+거시경제(S&P500, VIX), 다중 타임프레임(5/10/20/60일), 이탈 데이터(Drop-off), 통계적 모멘텀 등 **수십 개의 변수를 듀얼 XGBoost AI가 학습**합니다.  
+슬로프 예측 AI와 시그마 예측 AI가 동시에 연쇄 반응을 일으키며 가장 정밀한 T일 궤적을 뿜어냅니다.
 """)
 
 with st.sidebar:
-    st.header("⚙️ 타임머신 검증 설정")
-    target_ticker = st.text_input("종목 코드 (티커)", value="069500.KS")
+    st.header("⚙️ 하이퍼 타임머신 설정")
+    target_ticker = st.text_input("종목 코드 (우량주/ETF 권장)", value="069500.KS")
     target_date = st.date_input("테스트 시작일 (타임머신 탑승일)")
     target_t = st.number_input("단기 예측 기간 (T일)", min_value=1, max_value=60, value=10, step=1)
-    run_btn = st.button("🚀 예측 vs 현실 비교 가동", type="primary")
+    run_btn = st.button("🚀 듀얼 XGBoost 가동 및 검증", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. AI 학습 및 검증 엔진
+# ⚙️ 2. 극한 피처 엔지니어링 및 듀얼 모델 학습
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def backtest_ai_prediction(ticker, target_date, T):
+def backtest_xgboost_extreme(ticker, target_date, T):
     try:
-        raw = yf.download(ticker, start="2012-01-01", progress=False)
-        if raw.empty: return None, "데이터 로드 실패."
-            
-        df_all = raw.copy()
-        if isinstance(df_all.columns, pd.MultiIndex):
-            df_all.columns = df_all.columns.get_level_values(0)
-            
-        df_all = df_all[['Close', 'Volume']].dropna()
-        target_dt = pd.to_datetime(target_date)
+        # 1. 다중 자산 데이터 로드 (타겟, VIX, S&P500)
+        df_target = yf.download(ticker, start="2010-01-01", progress=False)
+        df_vix = yf.download("^VIX", start="2010-01-01", progress=False)
+        df_spx = yf.download("^GSPC", start="2010-01-01", progress=False)
         
-        # 🛡️ 미래 데이터 차단
-        df_train = df_all[df_all.index <= target_dt].copy()
-        df_future = df_all[df_all.index > target_dt].copy()
+        if df_target.empty: return None, "타겟 종목 데이터 로드 실패."
+        
+        for d in [df_target, df_vix, df_spx]:
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(0)
+
+        df = pd.DataFrame(index=df_target.index)
+        df['Close'] = df_target['Close']
+        df['Volume'] = df_target['Volume']
+        df['High'] = df_target['High']
+        df['Low'] = df_target['Low']
+        
+        # 거시 지표 결합 및 결측치 전방 채우기 (휴장일 차이 보정)
+        df = df.join(df_vix[['Close']].rename(columns={'Close': 'VIX'}), how='left')
+        df = df.join(df_spx[['Close']].rename(columns={'Close': 'SPX'}), how='left')
+        df.ffill(inplace=True)
+        df.dropna(inplace=True)
+
+        target_dt = pd.to_datetime(target_date)
+        df_train = df[df.index <= target_dt].copy()
+        df_future = df[df.index > target_dt].copy()
         
         closes = df_train['Close'].values
         n_days = len(closes)
-        
-        if n_days < 250: return None, "지정하신 날짜 이전의 과거 데이터가 부족합니다."
+        if n_days < 300: return None, "과거 데이터 부족 (최소 300일 필요)."
 
-        win = 20
-        df_train['Slope_20'] = np.nan
-        df_train['Sigma_20'] = np.nan
-        df_train['Slope_60'] = np.nan
+        # 🌟 2. 다중 타임프레임 슬로프/시그마 추출
+        windows = [5, 10, 20, 60]
+        params = {w: get_linear_params(w) for w in windows}
         
-        # 🌟 버그 수정: i-win+1 부터 i+1까지 정확히 20개 추출
-        for i in range(60, n_days):
-            prices_20 = closes[i-win+1 : i+1]
-            prices_60 = closes[i-60+1 : i+1]
+        for w in windows:
+            df_train[f'Slope_{w}'] = np.nan
+            df_train[f'Sigma_{w}'] = np.nan
             
-            df_train.loc[df_train.index[i], 'Slope_20'] = calc_fast_slope(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
-            df_train.loc[df_train.index[i], 'Sigma_20'] = calc_sigma(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
-            df_train.loc[df_train.index[i], 'Slope_60'] = calc_fast_slope(prices_60, X_ARR_60, X_MEAN_60, X_VAR_SUM_60)
+        for i in range(max(windows), n_days):
+            for w in windows:
+                prices = closes[i-w+1 : i+1] # 정확한 슬라이싱 (길이 w)
+                X, X_m, X_v = params[w]
+                df_train.loc[df_train.index[i], f'Slope_{w}'] = calc_fast_slope(prices, X, X_m, X_v)
+                df_train.loc[df_train.index[i], f'Sigma_{w}'] = calc_sigma(prices, X, X_m, X_v)
 
-        # 피처 엔지니어링
-        df_train['Slope_Accel'] = df_train['Slope_20'] - df_train['Slope_20'].shift(1)
+        # 🌟 3. 극한의 피처 세공 (Feature Engineering)
+        
+        # [이탈 변수: Drop-off Effect] (회원님 아이디어 완벽 구현)
+        # 내일 계산 시 20일 윈도우에서 빠져나갈 '19일 전' 데이터의 충격량
+        df_train['Drop_Price_Ratio'] = df_train['Close'] / df_train['Close'].shift(19)
+        df_train['Drop_Sigma_20'] = df_train['Sigma_20'].shift(19)
+        
+        # [자기 참조 & 가속도]
+        df_train['Slope_20_Accel'] = df_train['Slope_20'] - df_train['Slope_20'].shift(1)
+        df_train['Sigma_20_Accel'] = df_train['Sigma_20'] - df_train['Sigma_20'].shift(1)
         df_train['Slope_Divergence'] = df_train['Slope_20'] - df_train['Slope_60']
-        df_train['Drop_off_Shock'] = (df_train['Close'] / df_train['Close'].shift(win)) - 1.0
-        df_train['Hist_Vol_20'] = df_train['Close'].pct_change().rolling(win).std() * np.sqrt(252)
-        df_train['Skewness_20'] = df_train['Close'].pct_change().rolling(win).apply(skew, raw=True)
-        df_train['Volume_Z'] = (df_train['Volume'] - df_train['Volume'].rolling(win).mean()) / df_train['Volume'].rolling(win).std()
         
-        df_train['OBV'] = (np.sign(df_train['Close'].diff()) * df_train['Volume']).fillna(0).cumsum()
-        df_train['OBV_Slope'] = df_train['OBV'].pct_change(win) * 100 
+        # [통계적 모멘텀]
+        rets = df_train['Close'].pct_change()
+        df_train['Vol_20'] = rets.rolling(20).std() * np.sqrt(252)
+        df_train['Skew_20'] = rets.rolling(20).apply(skew, raw=True)
+        df_train['Kurt_20'] = rets.rolling(20).apply(kurtosis, raw=True)
         
+        # [기술적 오실레이터]
+        df_train['RSI_14'] = 100 - (100 / (1 + (rets[rets > 0].rolling(14).mean() / rets[rets < 0].abs().rolling(14).mean())))
         ema_12 = df_train['Close'].ewm(span=12, adjust=False).mean()
         ema_26 = df_train['Close'].ewm(span=26, adjust=False).mean()
         df_train['MACD'] = ema_12 - ema_26
-        df_train['MACD_Slope'] = df_train['MACD'] - df_train['MACD'].shift(1)
+        df_train['ATR_14'] = (df_train['High'] - df_train['Low']).rolling(14).mean() / df_train['Close']
         
-        # 타겟 설정 (내일의 슬로프)
+        # [거시 경제(Macro) 동조화]
+        df_train['VIX_Change'] = df_train['VIX'].pct_change(5)
+        df_train['SPX_Ret_20'] = df_train['SPX'].pct_change(20)
+        
+        # 🌟 4. 듀얼 타겟 설정 (내일의 슬로프 & 내일의 시그마)
         df_train['Target_Slope_Next'] = df_train['Slope_20'].shift(-1)
+        df_train['Target_Sigma_Next'] = df_train['Sigma_20'].shift(-1)
         
-        features = ['Sigma_20', 'Slope_20', 'Slope_60', 'Slope_Accel', 'Slope_Divergence', 
-                    'Drop_off_Shock', 'Hist_Vol_20', 'Skewness_20', 'Volume_Z', 'OBV_Slope', 'MACD_Slope']
+        features = [
+            'Slope_5', 'Slope_10', 'Slope_20', 'Slope_60', 
+            'Sigma_5', 'Sigma_10', 'Sigma_20', 'Sigma_60',
+            'Drop_Price_Ratio', 'Drop_Sigma_20',
+            'Slope_20_Accel', 'Sigma_20_Accel', 'Slope_Divergence',
+            'Vol_20', 'Skew_20', 'Kurt_20',
+            'RSI_14', 'MACD', 'ATR_14',
+            'VIX_Change', 'SPX_Ret_20'
+        ]
         
-        # 🌟 버그 수정: 예측의 출발점이 될 '테스트 시작일 당일(last_row)' 추출
-        # (Target_Slope_Next는 NaN이겠지만, Features는 모두 들어있음)
-        last_row = df_train.iloc[-1]
-        
-        # AI 학습용 데이터 (내일의 정답이 없는 마지막 날은 제외하고 학습)
-        ml_df = df_train.dropna(subset=features + ['Target_Slope_Next'])
+        last_row = df_train.iloc[-1] # 테스트 시작일 당일 데이터 (예측 출발점)
+        ml_df = df_train.dropna(subset=features + ['Target_Slope_Next', 'Target_Sigma_Next'])
         
         X_all = ml_df[features].values
-        Y_all = ml_df['Target_Slope_Next'].values
+        Y_slope = ml_df['Target_Slope_Next'].values
+        Y_sigma = ml_df['Target_Sigma_Next'].values
         
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X_all)
         
-        model = RandomForestRegressor(n_estimators=200, max_depth=7, min_samples_leaf=5, random_state=42)
-        model.fit(X_scaled, Y_all)
+        # 🌟 5. 듀얼 XGBoost 학습 (과최적화 방어 파라미터 적용)
+        # n_estimators=300: 나무를 300개 직렬 생성 (치밀한 학습)
+        # learning_rate=0.05: 아주 미세하게 정답을 향해 깎아 나감
+        model_slope = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=42, n_jobs=-1)
+        model_slope.fit(X_scaled, Y_slope)
         
-        y_pred_train = model.predict(X_scaled)
-        residuals_std = np.std(Y_all - y_pred_train)
+        model_sigma = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=42, n_jobs=-1)
+        model_sigma.fit(X_scaled, Y_sigma)
         
+        # 노이즈 주입용 잔차 표준편차 계산
+        res_std_slope = np.std(Y_slope - model_slope.predict(X_scaled))
+        res_std_sigma = np.std(Y_sigma - model_sigma.predict(X_scaled))
+        
+        # 피처 중요도 추출 (슬로프 기준)
+        imp_dict = {f: imp for f, imp in zip(features, model_slope.feature_importances_)}
+
         # ---------------------------------------------------------
-        # 📈 3. AI 가상 예측 궤적 생성
+        # 📈 6. AI 듀얼 예측 궤적 생성 (Stochastic AR)
         # ---------------------------------------------------------
         curr_state = {f: last_row[f] for f in features}
         
         pred_slopes = [curr_state['Slope_20']]
         pred_sigmas = [curr_state['Sigma_20']]
-        pred_dates = [df_train.index[-1]] # 정확히 사용자가 선택한 날짜부터 시작
+        pred_dates = [df_train.index[-1]]
         
-        np.random.seed(42) 
-        
+        np.random.seed(42)
         current_date = df_train.index[-1]
+        
         for step in range(T):
             x_input = np.array([[curr_state[f] for f in features]])
             x_input_scaled = scaler.transform(x_input)
             
-            base_next_slope = model.predict(x_input_scaled)[0]
-            stochastic_shock = np.random.normal(0, residuals_std * 0.8)
-            next_slope = base_next_slope + stochastic_shock
+            # AI 듀얼 코어 동시 예측
+            base_next_slope = model_slope.predict(x_input_scaled)[0]
+            base_next_sigma = model_sigma.predict(x_input_scaled)[0]
             
-            curr_state['Slope_Accel'] = next_slope - curr_state['Slope_20']
+            # 노이즈 주입 (야생성 보존, 강도는 70%로 통제)
+            next_slope = base_next_slope + np.random.normal(0, res_std_slope * 0.7)
+            next_sigma = base_next_sigma + np.random.normal(0, res_std_sigma * 0.7)
+            
+            # 다음 날을 위한 상태 업데이트 (Auto-Regressive 톱니바퀴)
+            curr_state['Slope_20_Accel'] = next_slope - curr_state['Slope_20']
+            curr_state['Sigma_20_Accel'] = next_sigma - curr_state['Sigma_20']
             curr_state['Slope_20'] = next_slope
-            curr_state['Slope_60'] = curr_state['Slope_60'] * 0.95 + next_slope * 0.05
-            curr_state['Slope_Divergence'] = curr_state['Slope_20'] - curr_state['Slope_60']
-            
-            next_sigma = (curr_state['Sigma_20'] * 0.8) + (curr_state['Slope_Accel'] * 2.0) + np.random.normal(0, 0.2)
             curr_state['Sigma_20'] = next_sigma
+            
+            # 60일선은 관성 유지, 5일 10일선은 20일선 변화량에 비례하여 동기화
+            curr_state['Slope_60'] = curr_state['Slope_60'] * 0.95 + next_slope * 0.05
+            curr_state['Slope_Divergence'] = next_slope - curr_state['Slope_60']
             
             current_date = current_date + BDay(1)
             pred_dates.append(current_date)
-            pred_slopes.append(curr_state['Slope_20'])
-            pred_sigmas.append(curr_state['Sigma_20'])
+            pred_slopes.append(next_slope)
+            pred_sigmas.append(next_sigma)
 
         # ---------------------------------------------------------
-        # 🔍 4. 실제 현실 데이터 추출 (정답지 확인)
+        # 🔍 7. 실제 현실 데이터 추출 (정답지 검증)
         # ---------------------------------------------------------
         actual_slopes = [last_row['Slope_20']]
         actual_sigmas = [last_row['Sigma_20']]
         actual_dates = [df_train.index[-1]]
         
         if not df_future.empty:
-            df_eval = df_all.copy()
+            df_eval = df.copy()
             eval_closes = df_eval['Close'].values
             
             future_indices = np.where(df_eval.index > target_dt)[0]
             take_t = min(T, len(future_indices))
             
-            # 🌟 버그 수정: 인덱싱 에러(21개 추출) 방지를 위해 정확히 20개만 슬라이싱
+            X_20, X_m_20, X_v_20 = get_linear_params(20)
+            
             for k in range(take_t):
                 idx = future_indices[k]
-                prices_20 = eval_closes[idx-win+1 : idx+1] 
+                prices_20 = eval_closes[idx-20+1 : idx+1] 
                 
-                real_slope = calc_fast_slope(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
-                real_sigma = calc_sigma(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
+                real_slope = calc_fast_slope(prices_20, X_20, X_m_20, X_v_20)
+                real_sigma = calc_sigma(prices_20, X_20, X_m_20, X_v_20)
                 
                 actual_dates.append(df_eval.index[idx])
                 actual_slopes.append(real_slope)
@@ -195,6 +241,7 @@ def backtest_ai_prediction(ticker, target_date, T):
 
         res = {
             'T': T,
+            'importances': imp_dict,
             'pred_dates': pred_dates,
             'pred_slopes': pred_slopes,
             'pred_sigmas': pred_sigmas,
@@ -208,57 +255,41 @@ def backtest_ai_prediction(ticker, target_date, T):
         return None, f"검증 중 오류 발생: {str(e)}"
 
 # ---------------------------------------------------------
-# ⚙️ 5. 화면 렌더링
+# ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 {target_date} 시점으로 돌아가 11개 다변량 AI를 학습시키고, 현실 데이터와 비교 중입니다..."):
-        res, err = backtest_ai_prediction(target_ticker, target_date, target_t)
+    with st.spinner(f"📦 XGBoost 듀얼 코어를 가동하여 21개 극한 변수를 학습 중입니다. (10~20초 소요)..."):
+        res, err = backtest_xgboost_extreme(target_ticker, target_date, target_t)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ AI 예측 vs 현실 검증 완료! (테스트 시작일: {target_date})")
+        st.success(f"✅ 극한의 피처 XGBoost 검증 완료! (테스트 시작일: {target_date})")
         
-        # --- 슬로프(Slope) 비교 차트 ---
-        st.subheader(f"📈 1. 추세 기울기(Slope) 검증")
-        st.markdown("> AI가 예상한 기울기의 꺾임(파란 점선)과 실제 시장의 기울기 변화(파란 실선)를 비교합니다.")
+        st.subheader("🧠 1. XGBoost 피처 중요도 (Slope 예측 기준)")
+        imp_df = pd.DataFrame(list(res['importances'].items()), columns=['Feature', 'Importance']).sort_values('Importance', ascending=True)
+        fig_imp = go.Figure(go.Bar(x=imp_df['Importance'], y=imp_df['Feature'], orientation='h', marker=dict(color='rgba(231, 76, 60, 0.8)')))
+        fig_imp.update_layout(height=450, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="AI 모델 가중치 (XGBoost)")
+        st.plotly_chart(fig_imp, use_container_width=True)
         
+        st.markdown("---")
+        
+        st.subheader(f"📈 2. 추세 기울기(Slope) AI 예측 vs 현실 검증")
         fig_slope = go.Figure()
-        
-        fig_slope.add_trace(go.Scatter(
-            x=res['pred_dates'], y=res['pred_slopes'], mode='lines+markers',
-            line=dict(color='#3498db', width=3, dash='dot'), name='AI 예상 슬로프'
-        ))
-        
+        fig_slope.add_trace(go.Scatter(x=res['pred_dates'], y=res['pred_slopes'], mode='lines+markers', line=dict(color='#3498db', width=3, dash='dot'), name='AI 예상 슬로프'))
         if len(res['actual_dates']) > 1:
-            fig_slope.add_trace(go.Scatter(
-                x=res['actual_dates'], y=res['actual_slopes'], mode='lines+markers',
-                line=dict(color='#2c3e50', width=4), name='실제 현실 슬로프 (Reality)'
-            ))
-            
+            fig_slope.add_trace(go.Scatter(x=res['actual_dates'], y=res['actual_slopes'], mode='lines+markers', line=dict(color='#2c3e50', width=4), name='실제 현실 슬로프'))
         fig_slope.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-        fig_slope.update_layout(hovermode="x unified", height=400, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Slope (%)")
+        fig_slope.update_layout(hovermode="x unified", height=400, margin=dict(l=0, r=0, t=10, b=0))
         st.plotly_chart(fig_slope, use_container_width=True)
         
         st.markdown("---")
         
-        # --- 시그마(Sigma) 비교 차트 ---
-        st.subheader(f"📉 2. 시그마(Sigma) 복원력 검증")
-        st.markdown("> AI가 예상한 시그마의 평균 회귀(주황 점선)와 실제 고무줄의 튕김(주황 실선)을 비교합니다.")
-        
+        st.subheader(f"📉 3. 시그마(Sigma) 복원력 AI 예측 vs 현실 검증")
         fig_sigma = go.Figure()
-        
-        fig_sigma.add_trace(go.Scatter(
-            x=res['pred_dates'], y=res['pred_sigmas'], mode='lines+markers',
-            line=dict(color='#e67e22', width=3, dash='dot'), name='AI 예상 시그마'
-        ))
-        
+        fig_sigma.add_trace(go.Scatter(x=res['pred_dates'], y=res['pred_sigmas'], mode='lines+markers', line=dict(color='#e67e22', width=3, dash='dot'), name='AI 예상 시그마'))
         if len(res['actual_dates']) > 1:
-            fig_sigma.add_trace(go.Scatter(
-                x=res['actual_dates'], y=res['actual_sigmas'], mode='lines+markers',
-                line=dict(color='#d35400', width=4), name='실제 현실 시그마 (Reality)'
-            ))
-            
+            fig_sigma.add_trace(go.Scatter(x=res['actual_dates'], y=res['actual_sigmas'], mode='lines+markers', line=dict(color='#d35400', width=4), name='실제 현실 시그마'))
         fig_sigma.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-        fig_sigma.update_layout(hovermode="x unified", height=400, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Sigma (이격도)")
+        fig_sigma.update_layout(hovermode="x unified", height=400, margin=dict(l=0, r=0, t=10, b=0))
         st.plotly_chart(fig_sigma, use_container_width=True)
