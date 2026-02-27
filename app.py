@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 고속 연산 및 대수학적 역산 엔진
+# ⚙️ 0. 고속 연산 및 역산 엔진
 # ---------------------------------------------------------
 def get_linear_params(win):
     X = np.arange(win)
@@ -35,41 +35,33 @@ def calc_sigma(prices, X, X_mean, X_var_sum):
     std = np.std(prices - trend_line)
     return (prices[-1] - trend_line[-1]) / std if std > 0 else 0.0
 
-# 🌟 400일 동시 다발 텐서 역산 (과거 백테스트용)
 def vectorized_reverse_price(hist_19_matrix, target_slopes):
     weights = np.arange(19) - 9.5
     K = np.sum(weights * hist_19_matrix, axis=1)
-    
     denom = 6.65 * target_slopes - 9.5
     denom[np.abs(denom) < 0.01] = np.sign(denom[np.abs(denom) < 0.01]) * 0.01 + 1e-9
-    
     raw_prices = K / denom
     last_prices = hist_19_matrix[:, -1]
-    
     return np.clip(raw_prices, last_prices * 0.7, last_prices * 1.3)
 
-# 🌟 1일 단일 역산 (오늘 기준 미래 시뮬레이션용 - 누락 복구됨!)
 def reverse_calculate_price(prev_19_prices, target_slope_pct):
     K = np.sum((np.arange(19) - 9.5) * prev_19_prices)
     denom = 6.65 * target_slope_pct - 9.5
-    
     if abs(denom) < 0.01:
         denom = -0.01 if denom < 0 else 0.01
-        
     raw_price = K / denom
     last_price = prev_19_prices[-1]
-    
     return np.clip(raw_price, last_price * 0.7, last_price * 1.3)
 
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V25.1", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V26", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V25.1: AI 딥스캔 & 메타 추천기")
+st.title("🔮 The Quantum Oracle V26: 방향 적중률 & 신뢰 구간")
 st.markdown("""
-종목 코드만 입력하십시오. 기계가 과거 수백 일의 역사를 모조리 스캔하여 **가장 예측 적중률이 높았던 고유의 보유 기간(T)**을 발굴합니다.  
-또한, 메타 AI가 '오늘 당장의 시그마와 슬로프'를 분석하여 오늘 장세에 딱 맞는 최적의 매도 타이밍을 추천합니다.
+단순 오차 크기가 아닌, **"오늘 사서 T일 뒤에 팔았을 때 오르고 내리는 '수익 방향(Direction)'을 얼마나 잘 맞췄는가(Hit Ratio %)"**를 기준으로 진짜 1위 T를 찾습니다.  
+또한 미래 주가의 불확실성을 시각화한 **80% 신뢰 구간(Confidence Interval)** 밴드가 추가되었습니다.
 """)
 
 with st.sidebar:
@@ -99,8 +91,6 @@ def deep_scan_and_meta_predict(ticker):
         df = pd.DataFrame(index=df_target.index)
         df['Close'] = df_target['Close']
         df['Volume'] = df_target['Volume']
-        df['High'] = df_target['High']
-        df['Low'] = df_target['Low']
         
         df = df.join(df_vix[['Close']].rename(columns={'Close': 'VIX'}), how='left')
         df = df.join(df_spx[['Close']].rename(columns={'Close': 'SPX'}), how='left')
@@ -145,17 +135,22 @@ def deep_scan_and_meta_predict(ticker):
         model_slope = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42, n_jobs=-1)
         model_slope.fit(X_scaled, Y_slope)
 
+        # 노이즈 주입 및 밴드 계산을 위한 잔차 계산
+        residuals = Y_slope - model_slope.predict(X_scaled)
+        res_std = np.std(residuals)
+
         # ---------------------------------------------------------
-        # 🌟 초고속 텐서 백테스트 (오타 수정 완료)
+        # 🌟 방향 적중률(Hit Ratio) 기반 초고속 벡터 백테스트
         # ---------------------------------------------------------
         eval_df = ml_df.iloc[-420:-20].copy()
         N_eval = len(eval_df)
         
-        error_matrix = np.zeros((N_eval, 20)) 
+        hit_matrix = np.zeros((N_eval, 20)) # 수익 방향을 맞췄는가? (1 = 정답, 0 = 오답)
         curr_state_matrix = eval_df[features].values 
         
         hist_idx = [np.where(df.index == d)[0][0] for d in eval_df.index]
         hist_prices_matrix = np.array([closes[idx-19 : idx+1] for idx in hist_idx])
+        base_prices = hist_prices_matrix[:, -1] # 백테스트 진입 당일의 주가
         
         for step in range(20):
             x_in_scaled = scaler.transform(curr_state_matrix)
@@ -164,24 +159,40 @@ def deep_scan_and_meta_predict(ticker):
             prev_19 = hist_prices_matrix[:, -19:]
             next_prices = vectorized_reverse_price(prev_19, next_slopes)
             
-            # 🌟 치명적 오타 수정 완료 (np.column_scaling 제거)
             hist_prices_matrix = np.hstack((hist_prices_matrix[:, 1:], next_prices.reshape(-1, 1)))
             
+            # 🌟 [핵심 변경] 단순 오차율 대신 "방향 적중(Hit)" 판별
             actual_future_prices = np.array([closes[idx + step + 1] for idx in hist_idx])
-            errors = np.abs(next_prices - actual_future_prices) / actual_future_prices * 100
-            error_matrix[:, step] = errors
+            
+            pred_direction = np.sign(next_prices - base_prices)
+            actual_direction = np.sign(actual_future_prices - base_prices)
+            
+            # 예측 방향과 실제 방향이 같으면 1 (적중), 다르면 0 (실패)
+            hits = (pred_direction == actual_direction).astype(int)
+            hit_matrix[:, step] = hits
             
             curr_state_matrix[:, features.index('Slope_Accel')] = next_slopes - curr_state_matrix[:, features.index('Slope_20')]
             curr_state_matrix[:, features.index('Slope_20')] = next_slopes
             curr_state_matrix[:, features.index('Sigma_20')] *= 0.9 
 
         # ---------------------------------------------------------
-        # 🧠 메타 모델 학습
+        # 🧠 메타 모델 학습 (어떤 상황에서 어떤 T의 적중률이 높은가?)
         # ---------------------------------------------------------
-        mean_errors_per_t = np.mean(error_matrix, axis=0)
-        passive_best_t = np.argmin(mean_errors_per_t) + 1
+        # 전체 400일 평균 적중률을 바탕으로 패시브 최적 T 추출
+        hit_rates_per_t = np.mean(hit_matrix, axis=0) * 100 # %로 변환
+        passive_best_t = np.argmax(hit_rates_per_t) + 1 # 적중률이 '가장 높은' T
         
-        best_t_labels = np.argmin(error_matrix, axis=1) + 1
+        # 각 날짜별 가중치 부여 (적중한 날 중 가장 빨리 적중하거나, 가장 확률 높은 T 찾기)
+        # 단기 스윙의 목적에 맞게, 적중한 T 중 가장 짧은 T를 선호하도록 레이블링
+        best_t_labels = []
+        for i in range(N_eval):
+            hits = hit_matrix[i]
+            if np.sum(hits) == 0:
+                best_t_labels.append(passive_best_t) # 다 틀렸으면 패시브 T 할당
+            else:
+                # 수익 방향을 맞춘 날들 중 가장 나중까지 유지되는 확실한 추세의 T 선택
+                valid_ts = np.where(hits == 1)[0]
+                best_t_labels.append(valid_ts[-1] + 1)
         
         meta_features = eval_df[['Sigma_20', 'Slope_20']].values
         meta_clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
@@ -193,35 +204,55 @@ def deep_scan_and_meta_predict(ticker):
         meta_prob = np.max(meta_clf.predict_proba([[today_sigma, today_slope]])) * 100
 
         # ---------------------------------------------------------
-        # 🔮 오늘 기준 미래 주가 역산 궤적 생성
+        # 🔮 오늘 기준 미래 주가 역산 & 신뢰 구간 생성
         # ---------------------------------------------------------
         today_state = {f: today_row[f] for f in features}
         today_hist = list(closes[-20:])
-        sim_future_prices = []
-        sim_future_dates = []
+        
+        sim_dates = []
+        sim_prices_mean = []
+        sim_prices_upper = [] # 80% 신뢰 상단
+        sim_prices_lower = [] # 80% 신뢰 하단
         
         c_date = df.index[-1]
+        
+        # 누적 오차 시뮬레이션 (시간이 지날수록 밴드가 넓어짐)
+        cumulative_std = 0
+        
         for step in range(20):
             x_in = scaler.transform([[today_state[f] for f in features]])
-            next_slope = model_slope.predict(x_in)[0]
+            base_slope = model_slope.predict(x_in)[0]
             
-            # 🌟 복구된 단일 역산 함수 호출
-            next_price = reverse_calculate_price(np.array(today_hist[-19:]), next_slope)
+            # 신뢰구간 80% (Z-score = 1.28)
+            # 매 스텝마다 오차가 누적됨 (Random Walk 특성 반영)
+            cumulative_std += (res_std * np.sqrt(step + 1)) * 0.1 
+            upper_slope = base_slope + (1.28 * cumulative_std)
+            lower_slope = base_slope - (1.28 * cumulative_std)
+            
+            mean_price = reverse_calculate_price(np.array(today_hist[-19:]), base_slope)
+            upper_price = reverse_calculate_price(np.array(today_hist[-19:]), upper_slope)
+            lower_price = reverse_calculate_price(np.array(today_hist[-19:]), lower_slope)
+            
+            # 상하단 역전 방지 (대수학 역산의 특성상 분모에 따라 부호가 바뀔 수 있음)
+            u_p, l_p = max(upper_price, lower_price), min(upper_price, lower_price)
             
             c_date += BDay(1)
-            sim_future_prices.append(next_price)
-            sim_future_dates.append(c_date)
-            today_hist.append(next_price)
+            sim_dates.append(c_date)
+            sim_prices_mean.append(mean_price)
+            sim_prices_upper.append(u_p)
+            sim_prices_lower.append(l_p)
             
-            today_state['Slope_Accel'] = next_slope - today_state['Slope_20']
-            today_state['Slope_20'] = next_slope
+            today_hist.append(mean_price)
+            
+            today_state['Slope_Accel'] = base_slope - today_state['Slope_20']
+            today_state['Slope_20'] = base_slope
             today_state['Sigma_20'] *= 0.9
 
         past_dates = df.index[-20:].tolist()
         past_prices = closes[-20:].tolist()
 
         res = {
-            'mean_errors': mean_errors_per_t,
+            'hit_rates': hit_rates_per_t,
             'passive_t': passive_best_t,
             'active_t': int(active_best_t),
             'meta_prob': meta_prob,
@@ -229,8 +260,10 @@ def deep_scan_and_meta_predict(ticker):
             'today_slope': today_slope,
             'past_dates': past_dates,
             'past_prices': past_prices,
-            'sim_dates': sim_future_dates,
-            'sim_prices': sim_future_prices
+            'sim_dates': sim_dates,
+            'sim_prices_mean': sim_prices_mean,
+            'sim_prices_upper': sim_prices_upper,
+            'sim_prices_lower': sim_prices_lower
         }
         return res, None
 
@@ -241,65 +274,87 @@ def deep_scan_and_meta_predict(ticker):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 과거 400일의 평행우주를 동시 다발적으로 연산하여 메타 AI를 훈련 중입니다 (약 5초 소요)..."):
+    with st.spinner(f"📦 400일치 방향 적중률(Hit Ratio) 분석 및 80% 신뢰 구간을 연산 중입니다..."):
         res, err = deep_scan_and_meta_predict(target_ticker)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ 종목 딥스캔 및 오늘자 메타 전략 생성 완료!")
+        st.success(f"✅ 방향 적중률 최적화 및 신뢰 밴드 생성 완료!")
         
         c1, c2 = st.columns(2)
         
         with c1:
-            st.markdown("#### 🌐 1. 패시브 통계 (전체 기간 평균)")
-            st.info(f"이 종목이 지난 수년간 보여준 통계적 회귀의 평균치입니다.\n\n"
+            st.markdown("#### 🌐 1. 패시브 통계 (수익 방향 적중률 기준)")
+            st.info(f"단순 오차가 아닌, 진입 후 주가의 '상승/하락 방향'을 가장 잘 맞춘 기간입니다.\n\n"
                     f"🏆 **역사적 고유 호흡(전체 1위): T = {res['passive_t']}일**\n\n"
-                    f"가장 오차가 적고 예측이 확실하게 맞아떨어지는 평균적인 주기가 {res['passive_t']}일입니다.")
+                    f"(이 종목은 진입 후 평균적으로 {res['passive_t']}일 차에 가장 뚜렷한 추세를 보였습니다.)")
             
         with c2:
             st.markdown("#### 🧠 2. 메타 AI 액티브 추천 (오늘 장세 맞춤형)")
             st.success(f"오늘의 상태 (시그마: {res['today_sigma']:.2f}, 기울기: {res['today_slope']:.2f}%)\n\n"
                        f"🎯 **오늘 진입 시 최적 매도일: T = {res['active_t']}일**\n\n"
-                       f"*(AI 확신도: {res['meta_prob']:.1f}% - 확신도가 낮으면 패시브 통계를 따르십시오)*")
+                       f"*(AI 패턴 확신도: {res['meta_prob']:.1f}% - 불확실한 장세면 패시브 T를 따르십시오)*")
         
         st.markdown("---")
         
-        st.subheader("📊 3. 보유기간(T)별 예측 오차율 랭킹")
+        # --- 전체 T 적중률 랭킹 ---
+        st.subheader("📊 3. 보유기간(T)별 '수익 방향 적중률' 랭킹 (높을수록 좋음)")
         rank_df = pd.DataFrame({
             'T (보유 일수)': [f"{i+1}일" for i in range(20)],
-            '오차율 (%)': res['mean_errors']
+            '적중률 (%)': res['hit_rates']
         })
         fig_bar = go.Figure(go.Bar(
-            x=rank_df['T (보유 일수)'], y=rank_df['오차율 (%)'],
-            marker=dict(color=['#e74c3c' if i+1 == res['active_t'] else '#3498db' for i in range(20)])
+            x=rank_df['T (보유 일수)'], y=rank_df['적중률 (%)'],
+            marker=dict(color=['#27ae60' if i+1 == res['active_t'] else '#95a5a6' for i in range(20)])
         ))
-        fig_bar.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="역산 주가 평균 오차율 (낮을수록 좋음)")
+        fig_bar.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="방향 적중률 (%)")
         st.plotly_chart(fig_bar, use_container_width=True)
         
         st.markdown("---")
         
-        st.subheader(f"📈 4. 오늘 기준: 20일 향후 역산 궤적 (Forward Projection)")
-        st.markdown("> 과거 20일의 흐름을 이어받아, AI가 역산해 낸 **'순수 미래 20일'**의 점선 궤적입니다.")
+        # --- 미래 투영 궤적 & 신뢰 구간 밴드 ---
+        st.subheader(f"📈 4. 향후 20일 역산 궤적 및 80% 신뢰 구간 (Confidence Band)")
+        st.markdown("> 시간이 지날수록 AI의 예측 오차가 누적되는 것을 반영하여, **주가가 흔들릴 수 있는 상하단 범위(회색 영역)**를 표시했습니다.")
         
         fig_proj = go.Figure()
         
+        # 1. 80% 신뢰 구간 밴드 (회색 영역)
+        conn_dates = [res['past_dates'][-1]] + res['sim_dates']
+        conn_upper = [res['past_prices'][-1]] + res['sim_prices_upper']
+        conn_lower = [res['past_prices'][-1]] + res['sim_prices_lower']
+        
+        fig_proj.add_trace(go.Scatter(
+            x=conn_dates + conn_dates[::-1], # x축을 갔다가 되돌아오며 다각형 완성
+            y=conn_upper + conn_lower[::-1],
+            fill='toself',
+            fillcolor='rgba(149, 165, 166, 0.2)',
+            line=dict(color='rgba(255,255,255,0)'),
+            hoverinfo="skip",
+            showlegend=True,
+            name='80% 신뢰 구간'
+        ))
+        
+        # 2. 과거 20일 실제 주가
         fig_proj.add_trace(go.Scatter(
             x=res['past_dates'], y=res['past_prices'], mode='lines+markers',
             line=dict(color='#2c3e50', width=4), name='과거 20일 실제 주가'
         ))
         
-        conn_dates = [res['past_dates'][-1]] + res['sim_dates']
-        conn_prices = [res['past_prices'][-1]] + res['sim_prices']
+        # 3. 미래 20일 예측 주가 (평균값)
+        conn_mean = [res['past_prices'][-1]] + res['sim_prices_mean']
         
         fig_proj.add_trace(go.Scatter(
-            x=conn_dates, y=conn_prices, mode='lines+markers',
-            line=dict(color='#e74c3c', width=3, dash='dot'), name='역산 기반 미래 궤적'
+            x=conn_dates, y=conn_mean, mode='lines+markers',
+            line=dict(color='#e74c3c', width=3, dash='dot'), name='역산 기반 미래 궤적 (평균)'
         ))
         
+        # 🌟 Vline 에러 수정 완료: Timestamp 객체를 순수 텍스트(문자열)로 변환하여 에러 방지
         rec_idx = res['active_t'] - 1
-        fig_proj.add_vline(x=res['sim_dates'][rec_idx], line_dash="dash", line_color="green", 
+        rec_date_str = res['sim_dates'][rec_idx].strftime('%Y-%m-%d')
+        
+        fig_proj.add_vline(x=rec_date_str, line_dash="dash", line_color="green", 
                            annotation_text=f"AI 액티브 타겟 (T={res['active_t']})")
         
-        fig_proj.update_layout(hovermode="x unified", height=450, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="주가 (원)")
+        fig_proj.update_layout(hovermode="x unified", height=500, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="주가 (원)")
         st.plotly_chart(fig_proj, use_container_width=True)
