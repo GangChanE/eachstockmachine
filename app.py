@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 고속 연산 함수
+# ⚙️ 0. 고속 연산 함수 (배열 길이 20으로 엄격히 통제)
 # ---------------------------------------------------------
 X_ARR_20 = np.arange(20)
 X_MEAN_20 = 9.5
@@ -39,19 +39,19 @@ def calc_sigma(prices, X_ARR, X_MEAN, X_VAR_SUM):
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V22", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V22.1", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V22: AI 예측 vs 현실 검증기")
+st.title("🔮 The Quantum Oracle V22.1: 무결점 AI 검증기")
 st.markdown("""
-과거의 특정 날짜로 타임머신을 타고 돌아가, **그날까지의 데이터만으로 AI를 학습**시킵니다.  
-이후 T일 동안 AI가 예측한 슬로프/시그마 궤적(점선)과 **실제 시장에서 일어난 현실 궤적(실선)**을 겹쳐 그려서 AI의 적중률을 눈으로 확인합니다.
+과거 특정 날짜까지의 데이터만으로 AI를 학습시키고, 미래를 완벽히 가린 상태에서 T일 간의 '슬로프 & 시그마' 궤적을 예측합니다.  
+그 후 **실제 시장에서 일어난 현실 궤적과 오버레이(Overlay)**하여 모델의 단기 스윙 정확도를 검증합니다.
 """)
 
 with st.sidebar:
     st.header("⚙️ 타임머신 검증 설정")
     target_ticker = st.text_input("종목 코드 (티커)", value="069500.KS")
     target_date = st.date_input("테스트 시작일 (타임머신 탑승일)")
-    target_t = st.number_input("단기 예측 기간 (T일)", min_value=1, max_value=60, value=10, step=1, help="단기 스윙을 위해 보통 5~20일 사이를 권장합니다.")
+    target_t = st.number_input("단기 예측 기간 (T일)", min_value=1, max_value=60, value=10, step=1)
     run_btn = st.button("🚀 예측 vs 현실 비교 가동", type="primary")
 
 # ---------------------------------------------------------
@@ -70,30 +70,30 @@ def backtest_ai_prediction(ticker, target_date, T):
         df_all = df_all[['Close', 'Volume']].dropna()
         target_dt = pd.to_datetime(target_date)
         
-        # 🛡️ 철저한 미래 데이터 차단 (Train 데이터셋)
+        # 🛡️ 미래 데이터 차단
         df_train = df_all[df_all.index <= target_dt].copy()
-        # 미래 실제 데이터 (Test 데이터셋 - 나중에 오버레이용)
         df_future = df_all[df_all.index > target_dt].copy()
         
         closes = df_train['Close'].values
-        volumes = df_train['Volume'].values
         n_days = len(closes)
         
-        if n_days < 250: return None, "지정하신 날짜 이전의 과거 데이터가 학습하기에 부족합니다."
+        if n_days < 250: return None, "지정하신 날짜 이전의 과거 데이터가 부족합니다."
 
         win = 20
         df_train['Slope_20'] = np.nan
         df_train['Sigma_20'] = np.nan
         df_train['Slope_60'] = np.nan
         
+        # 🌟 버그 수정: i-win+1 부터 i+1까지 정확히 20개 추출
         for i in range(60, n_days):
-            prices_20 = closes[i-win:i]
-            prices_60 = closes[i-60:i]
+            prices_20 = closes[i-win+1 : i+1]
+            prices_60 = closes[i-60+1 : i+1]
             
             df_train.loc[df_train.index[i], 'Slope_20'] = calc_fast_slope(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
             df_train.loc[df_train.index[i], 'Sigma_20'] = calc_sigma(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
             df_train.loc[df_train.index[i], 'Slope_60'] = calc_fast_slope(prices_60, X_ARR_60, X_MEAN_60, X_VAR_SUM_60)
 
+        # 피처 엔지니어링
         df_train['Slope_Accel'] = df_train['Slope_20'] - df_train['Slope_20'].shift(1)
         df_train['Slope_Divergence'] = df_train['Slope_20'] - df_train['Slope_60']
         df_train['Drop_off_Shock'] = (df_train['Close'] / df_train['Close'].shift(win)) - 1.0
@@ -109,11 +109,17 @@ def backtest_ai_prediction(ticker, target_date, T):
         df_train['MACD'] = ema_12 - ema_26
         df_train['MACD_Slope'] = df_train['MACD'] - df_train['MACD'].shift(1)
         
+        # 타겟 설정 (내일의 슬로프)
         df_train['Target_Slope_Next'] = df_train['Slope_20'].shift(-1)
         
         features = ['Sigma_20', 'Slope_20', 'Slope_60', 'Slope_Accel', 'Slope_Divergence', 
                     'Drop_off_Shock', 'Hist_Vol_20', 'Skewness_20', 'Volume_Z', 'OBV_Slope', 'MACD_Slope']
         
+        # 🌟 버그 수정: 예측의 출발점이 될 '테스트 시작일 당일(last_row)' 추출
+        # (Target_Slope_Next는 NaN이겠지만, Features는 모두 들어있음)
+        last_row = df_train.iloc[-1]
+        
+        # AI 학습용 데이터 (내일의 정답이 없는 마지막 날은 제외하고 학습)
         ml_df = df_train.dropna(subset=features + ['Target_Slope_Next'])
         
         X_all = ml_df[features].values
@@ -129,18 +135,17 @@ def backtest_ai_prediction(ticker, target_date, T):
         residuals_std = np.std(Y_all - y_pred_train)
         
         # ---------------------------------------------------------
-        # 📈 3. AI 가상 예측 궤적 생성 (미래 데이터를 모르는 상태)
+        # 📈 3. AI 가상 예측 궤적 생성
         # ---------------------------------------------------------
-        last_row = ml_df.iloc[-1]
         curr_state = {f: last_row[f] for f in features}
         
         pred_slopes = [curr_state['Slope_20']]
         pred_sigmas = [curr_state['Sigma_20']]
-        pred_dates = [target_dt]
+        pred_dates = [df_train.index[-1]] # 정확히 사용자가 선택한 날짜부터 시작
         
-        np.random.seed(42) # 비교의 일관성을 위해 시드 고정
+        np.random.seed(42) 
         
-        current_date = target_dt
+        current_date = df_train.index[-1]
         for step in range(T):
             x_input = np.array([[curr_state[f] for f in features]])
             x_input_scaled = scaler.transform(x_input)
@@ -167,29 +172,26 @@ def backtest_ai_prediction(ticker, target_date, T):
         # ---------------------------------------------------------
         actual_slopes = [last_row['Slope_20']]
         actual_sigmas = [last_row['Sigma_20']]
-        actual_dates = [target_dt]
+        actual_dates = [df_train.index[-1]]
         
         if not df_future.empty:
-            # 미래 데이터를 계산하기 위해 Train + Future 결합 (지표 연속성)
             df_eval = df_all.copy()
-            df_eval['Slope_20'] = np.nan
-            df_eval['Sigma_20'] = np.nan
-            
             eval_closes = df_eval['Close'].values
             
-            # target_date 이후의 데이터에 대해서만 시그마/슬로프 계산
             future_indices = np.where(df_eval.index > target_dt)[0]
             take_t = min(T, len(future_indices))
             
+            # 🌟 버그 수정: 인덱싱 에러(21개 추출) 방지를 위해 정확히 20개만 슬라이싱
             for k in range(take_t):
                 idx = future_indices[k]
-                prices_20 = eval_closes[idx-win:idx+1] # 그날 포함 20일
-                df_eval.loc[df_eval.index[idx], 'Slope_20'] = calc_fast_slope(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
-                df_eval.loc[df_eval.index[idx], 'Sigma_20'] = calc_sigma(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
+                prices_20 = eval_closes[idx-win+1 : idx+1] 
+                
+                real_slope = calc_fast_slope(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
+                real_sigma = calc_sigma(prices_20, X_ARR_20, X_MEAN_20, X_VAR_SUM_20)
                 
                 actual_dates.append(df_eval.index[idx])
-                actual_slopes.append(df_eval.loc[df_eval.index[idx], 'Slope_20'])
-                actual_sigmas.append(df_eval.loc[df_eval.index[idx], 'Sigma_20'])
+                actual_slopes.append(real_slope)
+                actual_sigmas.append(real_sigma)
 
         res = {
             'T': T,
@@ -209,7 +211,7 @@ def backtest_ai_prediction(ticker, target_date, T):
 # ⚙️ 5. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 {target_date} 시점으로 돌아가 AI를 학습시키고, 현실 데이터와 비교 중입니다..."):
+    with st.spinner(f"📦 {target_date} 시점으로 돌아가 11개 다변량 AI를 학습시키고, 현실 데이터와 비교 중입니다..."):
         res, err = backtest_ai_prediction(target_ticker, target_date, target_t)
         
     if err:
@@ -225,17 +227,17 @@ if run_btn:
         
         fig_slope.add_trace(go.Scatter(
             x=res['pred_dates'], y=res['pred_slopes'], mode='lines+markers',
-            line=dict(color='#3498db', width=2, dash='dot'), name='AI 예상 슬로프'
+            line=dict(color='#3498db', width=3, dash='dot'), name='AI 예상 슬로프'
         ))
         
         if len(res['actual_dates']) > 1:
             fig_slope.add_trace(go.Scatter(
                 x=res['actual_dates'], y=res['actual_slopes'], mode='lines+markers',
-                line=dict(color='#2980b9', width=4), name='실제 현실 슬로프'
+                line=dict(color='#2c3e50', width=4), name='실제 현실 슬로프 (Reality)'
             ))
             
         fig_slope.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-        fig_slope.update_layout(hovermode="x unified", height=350, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Slope (%)")
+        fig_slope.update_layout(hovermode="x unified", height=400, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Slope (%)")
         st.plotly_chart(fig_slope, use_container_width=True)
         
         st.markdown("---")
@@ -248,15 +250,15 @@ if run_btn:
         
         fig_sigma.add_trace(go.Scatter(
             x=res['pred_dates'], y=res['pred_sigmas'], mode='lines+markers',
-            line=dict(color='#e67e22', width=2, dash='dot'), name='AI 예상 시그마'
+            line=dict(color='#e67e22', width=3, dash='dot'), name='AI 예상 시그마'
         ))
         
         if len(res['actual_dates']) > 1:
             fig_sigma.add_trace(go.Scatter(
                 x=res['actual_dates'], y=res['actual_sigmas'], mode='lines+markers',
-                line=dict(color='#d35400', width=4), name='실제 현실 시그마'
+                line=dict(color='#d35400', width=4), name='실제 현실 시그마 (Reality)'
             ))
             
         fig_sigma.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-        fig_sigma.update_layout(hovermode="x unified", height=350, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Sigma (이격도)")
+        fig_sigma.update_layout(hovermode="x unified", height=400, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Sigma (이격도)")
         st.plotly_chart(fig_sigma, use_container_width=True)
