@@ -8,13 +8,29 @@ from pandas.tseries.offsets import BDay
 import plotly.graph_objects as go
 import math
 import warnings
+import requests # 차단 회피용 모듈 추가
 
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 호가 교정 함수 (KRX 기준)
+# ⚙️ 0. 야후 파이낸스 차단 회피용 데이터 로더 & 호가 함수
 # ---------------------------------------------------------
+def fetch_data_safely(ticker, start_date="2014-01-01"):
+    """
+    Streamlit Cloud 환경에서 yfinance가 봇으로 인식되어 차단당하는 것을 막기 위해
+    가짜 User-Agent 헤더를 씌운 세션(Session)으로 데이터를 가져옵니다.
+    """
+    session = requests.Session()
+    session.headers.update(
+        {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
+    )
+    
+    # 세션을 주입하여 다운로드 실행
+    raw = yf.download(ticker, start=start_date, progress=False, session=session)
+    return raw
+
 def round_to_tick(price, up=False):
+    """KRX 호가 단위 교정"""
     if price is None or np.isnan(price): return None
     if price < 2000: tick = 1
     elif price < 5000: tick = 5
@@ -30,7 +46,7 @@ def round_to_tick(price, up=False):
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V9 (360-Day Interactive)", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V9 (Safe Load)", page_icon="🔮", layout="wide")
 
 st.title("🔮 The Quantum Oracle V9: 마르코프 장세 사이클 & 360일 예측")
 st.markdown("""
@@ -53,8 +69,9 @@ with st.sidebar:
 @st.cache_data(show_spinner=False, ttl=3600)
 def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
     try:
-        raw = yf.download(ticker, start="2014-01-01", progress=False)
-        if raw.empty: return None, "데이터 로드 실패."
+        # 안전한 로드 함수 사용
+        raw = fetch_data_safely(ticker, start_date="2014-01-01")
+        if raw.empty: return None, "데이터 로드 실패 (종목 코드를 다시 확인해 주세요)."
             
         df = raw.copy()
         if isinstance(df.columns, pd.MultiIndex):
@@ -66,7 +83,7 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
         dates = df.index
         n_days = len(closes)
         
-        if n_days < 120: return None, "데이터 부족."
+        if n_days < 120: return None, "과거 데이터가 부족하여 분석할 수 없습니다."
 
         win20 = 20
         win60 = 60
@@ -96,9 +113,7 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
         regimes[(ann_slopes60 > -40) & (ann_slopes60 <= -10)] = 'Bear (📉하락)'
         regimes[ann_slopes60 <= -40] = 'Strong Bear (🧊강한하락)'
 
-        # ---------------------------------------------------------
-        # 📊 2. 장세 수명(Duration) 및 전환 확률(Transition) 통계 추출
-        # ---------------------------------------------------------
+        # 📊 2. 장세 수명 및 전환 확률 통계 추출
         regime_blocks = []
         curr_r = regimes[win60]
         start_idx = win60
@@ -115,11 +130,9 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
             r_blocks = [b for b in regime_blocks if b['regime'] == r]
             avg_dur = np.mean([b['duration'] for b in r_blocks]) if r_blocks else 20
             
-            # 다음 장세 예측 (가장 많이 전환된 장세)
             next_regimes = [regime_blocks[i+1]['regime'] for i, b in enumerate(regime_blocks[:-1]) if b['regime'] == r]
             most_likely_next = max(set(next_regimes), key=next_regimes.count) if next_regimes else 'Random (⚖️횡보)'
             
-            # 해당 장세의 일일 평균 수익률 및 변동성
             r_indices = np.where(regimes == r)[0]
             daily_rets = []
             for idx in r_indices:
@@ -129,9 +142,7 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
             
             regime_stats[r] = {'avg_dur': max(5, int(avg_dur)), 'next': most_likely_next, 'mean_ret': mean_ret, 'std_ret': std_ret}
 
-        # ---------------------------------------------------------
         # 📈 3. 360일 장기 궤적 (Trajectory) 생성
-        # ---------------------------------------------------------
         cur_price = closes[-1]
         last_block = regime_blocks[-1]
         current_regime = last_block['regime']
@@ -143,7 +154,6 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
         c_r = current_regime
         r_d = remaining_days
         
-        # 360일간의 장세 릴레이 시뮬레이션
         while len(path_regimes) < 360:
             take = min(r_d, 360 - len(path_regimes))
             path_regimes.extend([c_r] * take)
@@ -163,7 +173,6 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
             cum_var += (sr ** 2)
             std_cum = np.sqrt(cum_var)
             
-            # 90% 신뢰구간 (1.645 * 누적 표준편차)
             low_p = sim_price * (1 - 1.645 * std_cum)
             high_p = sim_price * (1 + 1.645 * std_cum)
             pred_date = base_date + BDay(t + 1)
@@ -175,14 +184,15 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
                 'High90': round_to_tick(high_p, up=True)
             })
 
-        # ---------------------------------------------------------
-        # 🛡️ 4. 맞춤형 출구 최적화 (기존 3x3x3 로직 유지)
-        # ---------------------------------------------------------
+        # 🛡️ 4. 맞춤형 출구 최적화 (2D)
         ent_dt = pd.to_datetime(ent_date)
         closest_idx = np.argmin(np.abs(dates - ent_dt))
         my_ent_sig = sigmas[closest_idx]
         my_regime = regimes[closest_idx]
         
+        if my_ent_sig == 999.0 or my_regime == 'Unknown':
+            return None, "진입 날짜의 데이터가 부족합니다."
+            
         c_ent_p = np.round(-my_ent_sig, 1)
         DROP_RANGE = np.round(np.arange(0.1, 5.1, 0.1), 1)
         EXT_RANGE = np.round(np.arange(-1.0, 5.1, 0.1), 1)
@@ -244,13 +254,13 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
         return res, None
 
     except Exception as e:
-        return None, f"시스템 오류: {str(e)}"
+        return None, f"데이터 분석 중 오류 발생: {str(e)}"
 
 # ---------------------------------------------------------
 # ⚙️ 3. 화면 렌더링 (Plotly 그래프 포함)
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner("📦 마르코프 체인 알고리즘을 통한 360일 장기 궤적을 연산 중입니다..."):
+    with st.spinner("📦 마르코프 체인 알고리즘을 통해 안전하게 데이터를 로드하고 360일 궤적을 연산 중입니다..."):
         res, err = run_markov_oracle(target_ticker, entry_date, entry_price, tax_rate, fee)
         
     if err:
@@ -258,7 +268,6 @@ if run_btn:
     else:
         st.success(f"✅ 연산 완료!")
         
-        # --- Part 1: 현재 장세 생명 주기 브리핑 ---
         st.subheader("⏳ 1. 현재 시장 장세 및 수명(Cycle) 예측")
         c1, c2, c3 = st.columns(3)
         c1.metric("현재 시장 장세", res['curr_regime'])
@@ -266,35 +275,29 @@ if run_btn:
         c3.metric("예상 전환 시점 (Next)", f"약 {res['remaining_days']}일 뒤", f"예상 다음 장세: {res['next_regime_pred']}", delta_color="normal")
         
         st.markdown("---")
-        
-        # --- Part 2: 360일 인터랙티브 궤적 그래프 ---
         st.subheader("📈 2. 향후 360일 예상 가격 궤적 (Interactive Chart)")
-        st.markdown("> 차트 위에 마우스를 올리거나 터치하면 해당 지점의 **날짜, 예상 장세, 90% 범위 가격**을 볼 수 있습니다.")
+        st.markdown("> 차트 위에 마우스를 올리거나 터치하면 **날짜, 예상 장세, 90% 범위 가격**이 표시됩니다.")
         
         traj_df = pd.DataFrame(res['trajectory'])
-        
         fig = go.Figure()
         
-        # 상단 밴드
         fig.add_trace(go.Scatter(
             x=traj_df['Date'], y=traj_df['High90'], mode='lines',
             line=dict(width=0), name='상위 5% 한계', showlegend=False
         ))
         
-        # 하단 밴드 (색칠)
         fig.add_trace(go.Scatter(
             x=traj_df['Date'], y=traj_df['Low90'], mode='lines',
             line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.2)',
             name='90% 확률 밴드'
         ))
         
-        # 중심 가격 (통계적 밀집 구간)
         fig.add_trace(go.Scatter(
             x=traj_df['Date'], y=traj_df['Center'], mode='lines',
             line=dict(color='#e74c3c', width=2), name='예상 중심가',
             customdata=traj_df['Regime'],
             hovertemplate="<b>%{x|%Y-%m-%d} (T+%{text})</b><br>" +
-                          "장세: %{customdata}<br>" +
+                          "예상 장세: %{customdata}<br>" +
                           "예상가: ₩%{y:,.0f}<extra></extra>",
             text=traj_df['T']
         ))
@@ -306,8 +309,6 @@ if run_btn:
         st.plotly_chart(fig, use_container_width=True)
         
         st.markdown("---")
-        
-        # --- Part 3: 최적 출구 전략 ---
         st.subheader("🎯 3. 진입 조건 맞춤형 최적 출구 전략")
         st.markdown(f"> 나의 진입 조건(**{res['regime']} / Sigma {res['ent_sigma']:.2f}**)에서 누적 수익을 가장 극대화했던 타점입니다.")
         
@@ -317,7 +318,7 @@ if run_btn:
             if res['target_min'] > 0:
                 st.metric(label="목표 도달 시 밴드", value=f"₩{res['target_min']:,} ~ ₩{res['target_max']:,}")
             else:
-                st.write("해당 조건의 유효한 익절 백테스트 데이터가 부족합니다.")
+                st.write("해당 조건의 유효한 백테스트 데이터가 부족합니다.")
             
         with col2:
             st.error(f"🚨 **생명선 (Trailing Stop)**")
