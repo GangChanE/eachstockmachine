@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import linregress
-from scipy.ndimage import uniform_filter
 import plotly.graph_objects as go
 import warnings
 
@@ -16,47 +15,43 @@ X_ARR = np.arange(20)
 X_MEAN = 9.5
 X_VAR_SUM = 665.0 
 
-def calc_fast_sigma_slope(prices_20):
-    y_mean = np.mean(prices_20)
-    slope = np.sum((X_ARR - X_MEAN) * (prices_20 - y_mean)) / X_VAR_SUM
-    intercept = y_mean - slope * X_MEAN
-    trend_line = slope * X_ARR + intercept
-    std = np.std(prices_20 - trend_line)
-    
-    current_price = prices_20[-1]
-    sigma = (current_price - trend_line[-1]) / std if std > 0 else 0.0
-    slope_pct = (slope / current_price) * 100 if current_price > 0 else 0.0
-    
-    return sigma, slope_pct
+def calc_fast_sigmas(closes, win=20):
+    """전체 기간의 20일 시그마를 고속으로 추출합니다."""
+    n_days = len(closes)
+    sigmas = np.full(n_days, np.nan)
+    for i in range(win, n_days):
+        prices_20 = closes[i-win:i]
+        y_mean = np.mean(prices_20)
+        slope = np.sum((X_ARR - X_MEAN) * (prices_20 - y_mean)) / X_VAR_SUM
+        intercept = y_mean - slope * X_MEAN
+        trend_line = slope * X_ARR + intercept
+        std = np.std(prices_20 - trend_line)
+        if std > 0:
+            sigmas[i] = (closes[i] - trend_line[-1]) / std
+    return sigmas
 
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V18.3", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V19", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V18.3: 3D 지형도 (절대 색상 고정)")
+st.title("🔮 The Quantum Oracle V19: 평균 회귀 반감기 분석기")
 st.markdown("""
-**절대 색상 스케일(Absolute Color Scale)**이 적용되었습니다.  
-이제 종목이 바뀌거나 필터 강도를 조절해도 **수익률 0%는 항상 중간색(흰색), +30% 이상은 진한 붉은색, -30% 이하는 진한 푸른색**으로 고정되어 다른 종목들과 직관적인 비교가 가능합니다.
+진입 시점의 **시그마(x)**와 T일 후의 **시그마 변화량(y)**을 비교하여, 해당 종목이 가장 빠르고 정확하게 본래의 추세(평균)로 돌아오는 최적의 보유 기간(T)을 찾아냅니다.  
+선형성(결정계수 $R^2$)이 가장 높은 Top 10 그래프를 출력합니다.
 """)
 
 with st.sidebar:
-    st.header("⚙️ 3D 지형도 설정")
-    target_ticker = st.text_input("종목 코드 (티커)", value="069500.KS") # KODEX 200 기본값
-    target_t = st.number_input("T일 후 수익률 (보유 기간)", min_value=1, max_value=250, value=20, step=1)
-    smooth_size = st.slider("데이터 수집 반경 (Smoothing Size)", min_value=1, max_value=7, value=3, step=2)
-    
-    st.markdown("---")
-    # 🌟 사용자 맞춤형 색상 고정 범위 설정 추가
-    color_limit = st.number_input("컬러 기준선 (± %)", min_value=10, max_value=100, value=30, step=5, help="이 수치 이상/이하의 수익률은 가장 진한 색으로 칠해집니다.")
-    
-    run_btn = st.button("🚀 절대 색상 지형도 생성", type="primary")
+    st.header("⚙️ 백테스트 설정")
+    target_ticker = st.text_input("종목 코드 (티커)", value="069500.KS") # KODEX 200 등 점잖은 종목 추천
+    max_t = st.number_input("최대 탐색 기간 (Max T)", min_value=10, max_value=120, value=60, step=10)
+    run_btn = st.button("🚀 최적의 회귀 주기(T) 탐색", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. 3D 매트릭스 엔진
+# ⚙️ 2. 핵심 분석 엔진 (Sigma vs Delta Sigma)
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def generate_3d_landscape_spatial(ticker, T, filter_size):
+def analyze_mean_reversion(ticker, max_t):
     try:
         raw = yf.download(ticker, start="2014-01-01", progress=False)
         if raw.empty: return None, "데이터 로드 실패."
@@ -69,126 +64,110 @@ def generate_3d_landscape_spatial(ticker, T, filter_size):
         closes = df['Close'].values
         n_days = len(closes)
         
-        if n_days < 120 + T: return None, "과거 데이터가 부족합니다."
+        if n_days < 120: return None, "과거 데이터 부족."
 
-        win = 20
-        sigmas = np.full(n_days, np.nan)
-        slopes = np.full(n_days, np.nan)
-        
-        for i in range(win, n_days):
-            sig, slp = calc_fast_sigma_slope(closes[i-win:i])
-            sigmas[i] = sig
-            slopes[i] = slp
-            
-        df['Slope'] = slopes
+        # 모든 날짜의 시그마 계산
+        sigmas = calc_fast_sigmas(closes)
         df['Sigma'] = sigmas
-        df['Future_Ret'] = (df['Close'].shift(-T) / df['Close'] - 1.0) * 100
         
-        valid_df = df.dropna(subset=['Slope', 'Sigma', 'Future_Ret'])
+        results = []
         
-        dx = 0.1  
-        dy = 0.05 
-        
-        x_min, x_max = valid_df['Slope'].min(), valid_df['Slope'].max()
-        y_min, y_max = valid_df['Sigma'].min(), valid_df['Sigma'].max()
-        
-        x_bins = np.arange(x_min - dx, x_max + dx*2, dx)
-        y_bins = np.arange(y_min - dy, y_max + dy*2, dy)
-        
-        x_centers = x_bins[:-1] + dx/2
-        y_centers = y_bins[:-1] + dy/2
-        
-        valid_df['x_bin'] = pd.cut(valid_df['Slope'], bins=x_bins, labels=False)
-        valid_df['y_bin'] = pd.cut(valid_df['Sigma'], bins=y_bins, labels=False)
-        
-        grouped = valid_df.groupby(['x_bin', 'y_bin'])['Future_Ret'].median().reset_index()
-        
-        Z_raw = np.full((len(y_centers), len(x_centers)), np.nan)
-        for _, row in grouped.iterrows():
-            Z_raw[int(row['y_bin']), int(row['x_bin'])] = row['Future_Ret']
+        # T=1 부터 max_t 까지 반복
+        for t in range(1, max_t + 1):
+            # T일 후의 시그마 값을 당겨옴 (Shift)
+            df[f'Sigma_T{t}'] = df['Sigma'].shift(-t)
+            # 시그마 변화량 (y축) = T일 후 시그마 - 오늘 시그마
+            df[f'Delta_Sigma_T{t}'] = df[f'Sigma_T{t}'] - df['Sigma']
             
-        mask = ~np.isnan(Z_raw)
-        Z_filled = np.nan_to_num(Z_raw, nan=0.0)
-        
-        if filter_size > 1:
-            Z_sum = uniform_filter(Z_filled, size=filter_size, mode='constant', cval=0.0) * (filter_size**2)
-            valid_count = uniform_filter(mask.astype(float), size=filter_size, mode='constant', cval=0.0) * (filter_size**2)
+            # NaN 제거
+            valid_df = df.dropna(subset=['Sigma', f'Delta_Sigma_T{t}'])
+            x = valid_df['Sigma'].values
+            y = valid_df[f'Delta_Sigma_T{t}'].values
             
-            Z_smooth = np.full_like(Z_raw, np.nan)
-            valid_mask = valid_count > 0
-            Z_smooth[valid_mask] = Z_sum[valid_mask] / valid_count[valid_mask]
-        else:
-            Z_smooth = Z_raw
-            
-        res = {
-            'X': x_centers,
-            'Y': y_centers,
-            'Z': Z_smooth,
-            'T': T
-        }
-        return res, None
+            if len(x) > 50:
+                slope, intercept, r_value, p_value, std_err = linregress(x, y)
+                r_squared = r_value ** 2 # 결정계수 (선형성의 뚜렷함)
+                
+                # 잔차(Residual)의 표준편차 계산
+                expected_y = slope * x + intercept
+                residuals = y - expected_y
+                res_std = np.std(residuals)
+                
+                results.append({
+                    'T': t,
+                    'R2': r_squared,
+                    'Correlation': r_value,
+                    'Slope': slope,
+                    'Intercept': intercept,
+                    'Residual_Std': res_std,
+                    'x_data': x,
+                    'y_data': y
+                })
+                
+        # R-squared(결정계수)가 가장 높은 순으로 정렬 (가장 선형성이 두드러지는 T)
+        results_sorted = sorted(results, key=lambda k: k['R2'], reverse=True)
+        return results_sorted[:10], None # Top 10 반환
 
     except Exception as e:
         return None, f"시스템 오류: {str(e)}"
 
 # ---------------------------------------------------------
-# ⚙️ 3. 3D 화면 렌더링 (Plotly)
+# ⚙️ 3. 화면 렌더링 (Plotly 2D Scatter)
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 고해상도 그리드 생성 후 공간 스무딩 및 절대 색상 스케일을 적용 중입니다..."):
-        res, err = generate_3d_landscape_spatial(target_ticker, target_t, smooth_size)
+    with st.spinner(f"📦 T=1~{max_t}일 간의 시그마 복원력을 테스트 중입니다..."):
+        top_results, err = analyze_mean_reversion(target_ticker, max_t)
         
     if err:
         st.error(err)
     else:
-        st.success("✅ 지형도 생성 완료!")
+        st.success(f"✅ 분석 완료! 가장 뚜렷한 평균 회귀를 보여주는 Top 10 주기(T)입니다.")
+        st.markdown("> **해석 방법:** 그래프의 점들이 우하향 대각선에 예쁘게 모여있을수록($R^2$가 높을수록) 훌륭한 주기입니다. 진입 시그마가 +3일 때 시그마 변화량이 -3 근처라면 완벽히 제자리로 돌아왔다는 뜻입니다.")
         
-        X = res['X']
-        Y = res['Y']
-        Z = res['Z']
-        T = res['T']
-        
-        fig = go.Figure()
-        
-        # 🌟 핵심: cmin과 cmax를 강제로 고정하여 색상 기준을 절대화
-        fig.add_trace(go.Surface(
-            z=Z, x=X, y=Y,
-            colorscale='RdBu_r', 
-            cmin=-color_limit, # 진한 파랑색의 기준 (예: -30%)
-            cmax=color_limit,  # 진한 빨강색의 기준 (예: +30%)
-            colorbar=dict(title=f"수익률 (%)<br>고정 기준: ±{color_limit}%"),
-            contours=dict(
-                z=dict(show=True, usecolormap=True, project_z=True) 
-            ),
-            connectgaps=False 
-        ))
-        
-        # Z=0 (수익률 0%) 바닥 평면 추가
-        zero_plane = np.zeros((len(Y), len(X)))
-        fig.add_trace(go.Surface(
-            z=zero_plane, x=X, y=Y,
-            showscale=False,
-            opacity=0.3, 
-            colorscale=[[0, 'gray'], [1, 'gray']],
-            hoverinfo='skip'
-        ))
-        
-        fig.update_layout(
-            title=f'[{target_ticker}] T+{T}일 절대 색상 수익률 지형도',
-            autosize=True,
-            height=800,
-            scene=dict(
-                xaxis_title='Slope (추세 기울기 %)',
-                yaxis_title='Sigma (볼린저 이격도)',
-                zaxis_title=f'T+{T}일 수익률 (%)',
-                camera=dict(
-                    eye=dict(x=1.5, y=-1.5, z=1.2) 
-                )
-            ),
-            margin=dict(l=0, r=0, b=0, t=50)
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("---")
-        st.info(f"💡 **절대 색상 고정 안내:** 좌측 사이드바에서 설정한 `±{color_limit}%`를 기준으로 색상이 칠해집니다. 따라서 종목을 변경하며 여러 번 돌려도 붉은색의 짙음만으로 어떤 종목이 더 폭발적인 알파(Alpha)를 가졌는지 공정하게 1:1 비교가 가능합니다.")
+        # 2개씩 짝지어서 5줄로 출력 (총 10개)
+        for i in range(0, 10, 2):
+            cols = st.columns(2)
+            
+            for j in range(2):
+                if i + j < len(top_results):
+                    res = top_results[i + j]
+                    t_val = res['T']
+                    r2_val = res['R2']
+                    res_std = res['Residual_Std']
+                    
+                    fig = go.Figure()
+                    
+                    # 산점도 (실제 데이터 점들)
+                    fig.add_trace(go.Scatter(
+                        x=res['x_data'], y=res['y_data'],
+                        mode='markers',
+                        marker=dict(size=3, color='rgba(52, 152, 219, 0.4)'),
+                        name='실제 변화량'
+                    ))
+                    
+                    # 선형 추세선
+                    x_line = np.array([np.min(res['x_data']), np.max(res['x_data'])])
+                    y_line = res['Slope'] * x_line + res['Intercept']
+                    
+                    fig.add_trace(go.Scatter(
+                        x=x_line, y=y_line,
+                        mode='lines',
+                        line=dict(color='red', width=3),
+                        name=f'추세선 (Slope: {res["Slope"]:.2f})'
+                    ))
+                    
+                    # 기준선 (0선)
+                    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+                    
+                    fig.update_layout(
+                        title=f"🥇 Rank {i+j+1} | T = {t_val}일 뒤<br><sup>선형성(R²): {r2_val:.3f} | 오차(Std): {res_std:.2f}</sup>",
+                        xaxis_title="진입 당일 시그마 (x)",
+                        yaxis_title=f"T+{t_val}일 후 시그마 변화량 (y)",
+                        height=400,
+                        margin=dict(l=0, r=0, t=50, b=0),
+                        showlegend=False
+                    )
+                    
+                    with cols[j]:
+                        st.plotly_chart(fig, use_container_width=True)
