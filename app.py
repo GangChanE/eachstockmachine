@@ -8,29 +8,13 @@ from pandas.tseries.offsets import BDay
 import plotly.graph_objects as go
 import math
 import warnings
-import requests # 차단 회피용 모듈 추가
 
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 야후 파이낸스 차단 회피용 데이터 로더 & 호가 함수
+# ⚙️ 0. 호가 교정 함수 (KRX 기준)
 # ---------------------------------------------------------
-def fetch_data_safely(ticker, start_date="2014-01-01"):
-    """
-    Streamlit Cloud 환경에서 yfinance가 봇으로 인식되어 차단당하는 것을 막기 위해
-    가짜 User-Agent 헤더를 씌운 세션(Session)으로 데이터를 가져옵니다.
-    """
-    session = requests.Session()
-    session.headers.update(
-        {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
-    )
-    
-    # 세션을 주입하여 다운로드 실행
-    raw = yf.download(ticker, start=start_date, progress=False, session=session)
-    return raw
-
 def round_to_tick(price, up=False):
-    """KRX 호가 단위 교정"""
     if price is None or np.isnan(price): return None
     if price < 2000: tick = 1
     elif price < 5000: tick = 5
@@ -46,7 +30,7 @@ def round_to_tick(price, up=False):
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V9 (Safe Load)", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V9", page_icon="🔮", layout="wide")
 
 st.title("🔮 The Quantum Oracle V9: 마르코프 장세 사이클 & 360일 예측")
 st.markdown("""
@@ -69,10 +53,12 @@ with st.sidebar:
 @st.cache_data(show_spinner=False, ttl=3600)
 def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
     try:
-        # 안전한 로드 함수 사용
-        raw = fetch_data_safely(ticker, start_date="2014-01-01")
+        # [에러 수정 완료] yfinance의 자체 내장 우회 엔진을 믿고 순수하게 호출
+        raw = yf.download(ticker, start="2014-01-01", progress=False)
+        
         if raw.empty: return None, "데이터 로드 실패 (종목 코드를 다시 확인해 주세요)."
             
+        # 최신 yfinance MultiIndex 대응
         df = raw.copy()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -260,7 +246,7 @@ def run_markov_oracle(ticker, ent_date, ent_price, tax, fee_rate):
 # ⚙️ 3. 화면 렌더링 (Plotly 그래프 포함)
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner("📦 마르코프 체인 알고리즘을 통해 안전하게 데이터를 로드하고 360일 궤적을 연산 중입니다..."):
+    with st.spinner("📦 마르코프 체인 알고리즘을 통해 360일 궤적을 연산 중입니다..."):
         res, err = run_markov_oracle(target_ticker, entry_date, entry_price, tax_rate, fee)
         
     if err:
@@ -268,6 +254,7 @@ if run_btn:
     else:
         st.success(f"✅ 연산 완료!")
         
+        # --- Part 1: 현재 장세 생명 주기 브리핑 ---
         st.subheader("⏳ 1. 현재 시장 장세 및 수명(Cycle) 예측")
         c1, c2, c3 = st.columns(3)
         c1.metric("현재 시장 장세", res['curr_regime'])
@@ -275,23 +262,29 @@ if run_btn:
         c3.metric("예상 전환 시점 (Next)", f"약 {res['remaining_days']}일 뒤", f"예상 다음 장세: {res['next_regime_pred']}", delta_color="normal")
         
         st.markdown("---")
+        
+        # --- Part 2: 360일 인터랙티브 궤적 그래프 ---
         st.subheader("📈 2. 향후 360일 예상 가격 궤적 (Interactive Chart)")
         st.markdown("> 차트 위에 마우스를 올리거나 터치하면 **날짜, 예상 장세, 90% 범위 가격**이 표시됩니다.")
         
         traj_df = pd.DataFrame(res['trajectory'])
+        
         fig = go.Figure()
         
+        # 상단 밴드
         fig.add_trace(go.Scatter(
             x=traj_df['Date'], y=traj_df['High90'], mode='lines',
             line=dict(width=0), name='상위 5% 한계', showlegend=False
         ))
         
+        # 하단 밴드 (색칠)
         fig.add_trace(go.Scatter(
             x=traj_df['Date'], y=traj_df['Low90'], mode='lines',
             line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.2)',
             name='90% 확률 밴드'
         ))
         
+        # 중심 가격
         fig.add_trace(go.Scatter(
             x=traj_df['Date'], y=traj_df['Center'], mode='lines',
             line=dict(color='#e74c3c', width=2), name='예상 중심가',
@@ -309,6 +302,8 @@ if run_btn:
         st.plotly_chart(fig, use_container_width=True)
         
         st.markdown("---")
+        
+        # --- Part 3: 최적 출구 전략 ---
         st.subheader("🎯 3. 진입 조건 맞춤형 최적 출구 전략")
         st.markdown(f"> 나의 진입 조건(**{res['regime']} / Sigma {res['ent_sigma']:.2f}**)에서 누적 수익을 가장 극대화했던 타점입니다.")
         
