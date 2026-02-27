@@ -32,12 +32,12 @@ def round_to_tick(price, up=False):
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V13", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V14", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V13: 타임머신 & 실전 궤적 검증")
+st.title("🔮 The Quantum Oracle V14: 다중 확률 밴드(Fan Chart) 검증")
 st.markdown("""
-**1. 시계열 가중치(EWMA):** 최근 시장의 기세(모멘텀)에 높은 가중치를 주어 밋밋한 평균의 함정을 극복했습니다.  
-**2. 장세 피로도(Hazard Rate):** 장세가 길어질수록 붕괴 확률을 높여, 비현실적인 영구 상승/하락 폭발을 방지합니다.
+1,000번의 몬테카를로 평행우주 시뮬레이션을 통해 미래 궤적을 예측합니다.  
+"예측"의 오만을 버리고, **70%, 80%, 90%의 다중 확률 구간(Confidence Intervals)**을 그라데이션으로 겹쳐 그려내어 어떠한 호재/악재에도 대응할 수 있는 거시적 지지/저항 라인을 시각화합니다.
 """)
 
 with st.sidebar:
@@ -48,13 +48,13 @@ with st.sidebar:
     tax_rate = st.number_input("세율 적용 (%)", value=0.0, step=1.0) / 100.0
     fee = 0.003
     use_log_scale = st.checkbox("📈 Y축 로그 스케일 적용", value=False)
-    run_btn = st.button("🚀 피로도 반영 몬테카를로 가동", type="primary")
+    run_btn = st.button("🚀 다중 확률 궤적 몬테카를로 가동", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. 핵심 분석 엔진 (EWMA + Hazard Markov + GBM)
+# ⚙️ 2. 핵심 분석 엔진 (다중 백분위수 추출 적용)
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
+def run_v14_oracle(ticker, target_date, ent_price, tax, fee_rate):
     try:
         raw = yf.download(ticker, start="2014-01-01", progress=False)
         if raw.empty: return None, "데이터 로드 실패."
@@ -109,13 +109,13 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
         cur_slope = slopes20[-1]
         cur_price = closes[-1]
         
-        # 🌟 1. 최신 시장 가중치 부여 (EWMA - Half life 252일)
+        # 🌟 1. 최신 시장 가중치 부여 (EWMA)
         hl = 252.0
         decay = np.log(2) / hl
-        weights = np.exp(-decay * np.arange(n_days-1, -1, -1)) # 최근일수록 가중치 1에 수렴
+        weights = np.exp(-decay * np.arange(n_days-1, -1, -1)) 
 
-        # 📊 2. 가중치가 적용된 전이 행렬 (최근 흐름 반영)
-        trans_matrix = {r1: {r2: 0.05 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES} # Laplace Smoothing
+        # 📊 2. 가중치 적용 전이 행렬 (Laplace Smoothing 포함)
+        trans_matrix = {r1: {r2: 0.05 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES}
         
         regime_blocks = []
         curr_r = regimes[win60]
@@ -125,7 +125,7 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
             r_from = regimes[i]
             r_to = regimes[i+1]
             if r_from in trans_matrix and r_to in trans_matrix:
-                trans_matrix[r_from][r_to] += weights[i] # 빈도 대신 가중치 합산
+                trans_matrix[r_from][r_to] += weights[i]
                 
             if regimes[i+1] != curr_r:
                 regime_blocks.append({'regime': curr_r, 'duration': i + 1 - start_idx})
@@ -137,7 +137,7 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
             total = sum(trans_matrix[r1].values())
             for r2 in REGIME_NAMES: trans_matrix[r1][r2] /= total
 
-        # 🌟 3. 장세별 통계 계산 (가중 평균 및 피로도 한계치 산출)
+        # 🌟 3. 장세별 통계 계산
         regime_stats = {}
         for r in REGIME_NAMES:
             r_indices = np.where(regimes == r)[0]
@@ -153,12 +153,10 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 mu, sigma = 0.0, 0.02
                 
             r_blocks = [b['duration'] for b in regime_blocks if b['regime'] == r]
-            # 피로도 한계선: 과거 해당 장세 수명의 95% 백분위수
             max_dur = np.percentile(r_blocks, 95) if len(r_blocks) > 2 else 20
-            
             regime_stats[r] = {'mu': mu, 'sigma': sigma, 'max_dur': max(5, int(max_dur))}
 
-        # 📈 4. 해저드율(Hazard Rate)이 결합된 몬테카를로 시뮬레이션
+        # 📈 4. 해저드율 + GBM 몬테카를로 시뮬레이션
         n_sim = 1000
         days_ahead = 360
         sim_prices = np.zeros((n_sim, days_ahead))
@@ -172,11 +170,8 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
             price = cur_price
             
             for t in range(days_ahead):
-                # 🛡️ 피로도(Fatigue) 기반 확률 조정 로직
                 base_probs = {nxt: trans_matrix[c_r][nxt] for nxt in REGIME_NAMES}
                 max_d = regime_stats[c_r]['max_dur']
-                
-                # 수명이 한계치에 다가갈수록 피로도 지수 급증 (최대 0.95)
                 fatigue = min(0.95, (run_duration / max_d) ** 2)
                 
                 stay_prob = base_probs[c_r]
@@ -184,10 +179,8 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 diff = stay_prob - new_stay_prob
                 
                 base_probs[c_r] = new_stay_prob
-                # 이탈한 확률을 시장을 진정시키는 방향으로 분배
-                if c_r != 'Random':
-                    base_probs['Random'] += diff # 추세가 길어지면 횡보장으로 회귀 강제
-                else:
+                if c_r != 'Random': base_probs['Random'] += diff
+                else: 
                     base_probs['Bear'] += diff / 2
                     base_probs['Bull'] += diff / 2
                     
@@ -195,21 +188,21 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 probs_arr = np.array(probs_arr) / sum(probs_arr)
                 
                 next_r = np.random.choice(REGIME_NAMES, p=probs_arr)
-                
                 if next_r == c_r: run_duration += 1
-                else: 
-                    c_r = next_r
-                    run_duration = 1
+                else: c_r, run_duration = next_r, 1
                     
-                # 기하 브라운 운동 (GBM) 진행
-                mu = regime_stats[c_r]['mu']
-                sig = regime_stats[c_r]['sigma']
+                mu, sig = regime_stats[c_r]['mu'], regime_stats[c_r]['sigma']
                 price *= np.exp(np.random.normal(mu, sig))
                 sim_prices[i, t] = price
 
-        # 결과 백분위수 추출
+        # 📊 5. 다중 백분위수 (Fan Chart) 추출
+        # 90% (5~95), 80% (10~90), 70% (15~85)
         low_90_arr = np.percentile(sim_prices, 5, axis=0)
         high_90_arr = np.percentile(sim_prices, 95, axis=0)
+        low_80_arr = np.percentile(sim_prices, 10, axis=0)
+        high_80_arr = np.percentile(sim_prices, 90, axis=0)
+        low_70_arr = np.percentile(sim_prices, 15, axis=0)
+        high_70_arr = np.percentile(sim_prices, 85, axis=0)
         center_arr = np.percentile(sim_prices, 50, axis=0)
         
         trajectory = []
@@ -222,8 +215,9 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
             trajectory.append({
                 'Date': pred_date,
                 'Center': round_to_tick(center_arr[t], up=False),
-                'Low90': round_to_tick(low_90_arr[t], up=False),
-                'High90': round_to_tick(high_90_arr[t], up=True)
+                'Low90': round_to_tick(low_90_arr[t], up=False), 'High90': round_to_tick(high_90_arr[t], up=True),
+                'Low80': round_to_tick(low_80_arr[t], up=False), 'High80': round_to_tick(high_80_arr[t], up=True),
+                'Low70': round_to_tick(low_70_arr[t], up=False), 'High70': round_to_tick(high_70_arr[t], up=True)
             })
 
         # 검증용 실제 미래 데이터
@@ -234,7 +228,7 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
             actual_future_dates = df_future_cut.index.tolist()
             actual_future_prices = df_future_cut['Close'].tolist()
 
-        # 🎯 5. 듀얼 코어 백테스트 (현재 조건 유지)
+        # 🎯 6. 듀얼 코어 백테스트
         c_ent_p = np.round(-cur_sigma, 1) 
         DROP_RANGE = np.round(np.arange(0.1, 5.1, 0.1), 1)
         EXT_RANGE = np.round(np.arange(-1.0, 5.1, 0.1), 1)
@@ -309,26 +303,36 @@ def run_v13_oracle(ticker, target_date, ent_price, tax, fee_rate):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 최근 장세에 가중치(EWMA)를 부여하고, 피로도(Hazard)가 반영된 1,000회 시뮬레이션을 가동 중입니다..."):
-        res, err = run_v13_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
+    with st.spinner(f"📦 다중 확률(Fan Chart) 궤적을 연산 중입니다..."):
+        res, err = run_v14_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ V13 정밀 분석 완료! (분석 기준일: {target_date})")
+        st.success(f"✅ Fan Chart 정밀 분석 완료! (분석 기준일: {target_date})")
         
-        st.subheader("📈 1. 1,000회 몬테카를로 360일 지수 궤적 vs 실제 주가")
+        st.subheader("📈 1. 1,000회 몬테카를로: 다중 확률 밴드(Fan Chart) vs 실제 주가")
+        st.markdown("> **중심부일수록 확률 밀도가 높으며**, 어떠한 호재나 악재가 터져도 수학적으로 90% 안에 머물도록 밴드를 확장 설계했습니다.")
         
-        if use_log_scale:
-            st.info("ℹ️ **로그 스케일(Log Scale):** 폭발적인 지수 곡선이 안정적인 비율로 교정되어 보입니다.")
-            
         traj_df = pd.DataFrame(res['trajectory'])
         fig = go.Figure()
         
+        # 1. 90% 밴드 (가장 넓고 연함)
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High90'], mode='lines', line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low90'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.2)', name='90% 확률 밴드'))
-        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Center'], mode='lines', line=dict(color='#e74c3c', width=2, dash='dot'), name='예상 통계적 중심', hovertemplate="<b>%{x|%Y-%m-%d}</b><br>예상가: ₩%{y:,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low90'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.1)', name='90% 확률 구간'))
+
+        # 2. 80% 밴드 (중간 넓이)
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High80'], mode='lines', line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low80'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.25)', name='80% 확률 구간'))
+
+        # 3. 70% 밴드 (가장 좁고 진함)
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High70'], mode='lines', line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low70'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.4)', name='70% 확률 구간'))
+
+        # 4. 예상 중심가 (점선)
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Center'], mode='lines', line=dict(color='#e74c3c', width=2, dash='dot'), name='예상 통계적 중심', hovertemplate="<b>%{x|%Y-%m-%d}</b><br>중심 예상가: ₩%{y:,.0f}<extra></extra>"))
         
+        # 5. 실제 시장 흐름 (검은 실선)
         if res['actual_dates'] and len(res['actual_dates']) > 0:
             fig.add_trace(go.Scatter(x=res['actual_dates'], y=res['actual_prices'], mode='lines', line=dict(color='black', width=3), name='실제 시장 흐름 (Reality)'))
             
