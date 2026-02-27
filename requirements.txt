@@ -1,8 +1,8 @@
 streamlit
-yfinance
-pandas
 numpy
+pandas
+yfinance
 scipy
-matplotlib
 scikit-learn
+xgboost
 plotly
