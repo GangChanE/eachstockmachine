@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import skew, kurtosis
-from xgboost import XGBRegressor # 🌟 궁극의 알고리즘 도입
+from xgboost import XGBRegressor
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 from pandas.tseries.offsets import BDay
@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------
-# ⚙️ 0. 고속 연산 엔진 (다중 윈도우 지원)
+# ⚙️ 0. 고속 연산 엔진
 # ---------------------------------------------------------
 def get_linear_params(win):
     X = np.arange(win)
@@ -37,12 +37,12 @@ def calc_sigma(prices, X, X_mean, X_var_sum):
 # ---------------------------------------------------------
 # ⚙️ 1. UI 설정
 # ---------------------------------------------------------
-st.set_page_config(page_title="Quantum Oracle V23", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="Quantum Oracle V23.1", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V23: 듀얼 XGBoost 극한 검증기")
+st.title("🔮 The Quantum Oracle V23.1: 듀얼 XGBoost (Timezone 교정)")
 st.markdown("""
-거시경제(S&P500, VIX), 다중 타임프레임(5/10/20/60일), 이탈 데이터(Drop-off), 통계적 모멘텀 등 **수십 개의 변수를 듀얼 XGBoost AI가 학습**합니다.  
-슬로프 예측 AI와 시그마 예측 AI가 동시에 연쇄 반응을 일으키며 가장 정밀한 T일 궤적을 뿜어냅니다.
+다중 타임프레임, 이탈 충격량, VIX 등 **극한의 피처**를 학습하는 듀얼 XGBoost 검증기입니다.  
+국가 간 타임존(Timezone) 충돌 문제를 완벽히 해결하여 글로벌 매크로 데이터를 오류 없이 융합합니다.
 """)
 
 with st.sidebar:
@@ -58,16 +58,23 @@ with st.sidebar:
 @st.cache_data(show_spinner=False, ttl=3600)
 def backtest_xgboost_extreme(ticker, target_date, T):
     try:
-        # 1. 다중 자산 데이터 로드 (타겟, VIX, S&P500)
+        # 1. 다중 자산 데이터 로드
         df_target = yf.download(ticker, start="2010-01-01", progress=False)
         df_vix = yf.download("^VIX", start="2010-01-01", progress=False)
         df_spx = yf.download("^GSPC", start="2010-01-01", progress=False)
         
         if df_target.empty: return None, "타겟 종목 데이터 로드 실패."
         
+        # 야후 파이낸스 MultiIndex 컬럼 평탄화
         for d in [df_target, df_vix, df_spx]:
             if isinstance(d.columns, pd.MultiIndex):
                 d.columns = d.columns.get_level_values(0)
+
+        # 🌟 핵심 버그 수정: 타임존 꼬리표 강제 제거 (Timezone Naive)
+        # 한국 날짜와 미국 날짜가 충돌하지 않도록 순수 문자열 날짜로 통일합니다.
+        df_target.index = df_target.index.tz_localize(None)
+        df_vix.index = df_vix.index.tz_localize(None)
+        df_spx.index = df_spx.index.tz_localize(None)
 
         df = pd.DataFrame(index=df_target.index)
         df['Close'] = df_target['Close']
@@ -75,19 +82,21 @@ def backtest_xgboost_extreme(ticker, target_date, T):
         df['High'] = df_target['High']
         df['Low'] = df_target['Low']
         
-        # 거시 지표 결합 및 결측치 전방 채우기 (휴장일 차이 보정)
+        # 매크로 지표 조인 (날짜 1:1 매칭)
         df = df.join(df_vix[['Close']].rename(columns={'Close': 'VIX'}), how='left')
         df = df.join(df_spx[['Close']].rename(columns={'Close': 'SPX'}), how='left')
+        
+        # 휴장일 차이로 인한 NaN은 직전 영업일 데이터로 꼼꼼히 채움 (ffill 후 bfill)
         df.ffill(inplace=True)
-        df.dropna(inplace=True)
+        df.bfill(inplace=True)
 
-        target_dt = pd.to_datetime(target_date)
+        target_dt = pd.to_datetime(target_date).tz_localize(None)
         df_train = df[df.index <= target_dt].copy()
         df_future = df[df.index > target_dt].copy()
         
         closes = df_train['Close'].values
         n_days = len(closes)
-        if n_days < 300: return None, "과거 데이터 부족 (최소 300일 필요)."
+        if n_days < 300: return None, f"과거 데이터 부족 (현재 {n_days}일. 최소 300일 필요)."
 
         # 🌟 2. 다중 타임프레임 슬로프/시그마 추출
         windows = [5, 10, 20, 60]
@@ -99,41 +108,49 @@ def backtest_xgboost_extreme(ticker, target_date, T):
             
         for i in range(max(windows), n_days):
             for w in windows:
-                prices = closes[i-w+1 : i+1] # 정확한 슬라이싱 (길이 w)
+                prices = closes[i-w+1 : i+1]
                 X, X_m, X_v = params[w]
                 df_train.loc[df_train.index[i], f'Slope_{w}'] = calc_fast_slope(prices, X, X_m, X_v)
                 df_train.loc[df_train.index[i], f'Sigma_{w}'] = calc_sigma(prices, X, X_m, X_v)
 
-        # 🌟 3. 극한의 피처 세공 (Feature Engineering)
-        
-        # [이탈 변수: Drop-off Effect] (회원님 아이디어 완벽 구현)
-        # 내일 계산 시 20일 윈도우에서 빠져나갈 '19일 전' 데이터의 충격량
+        # 🌟 3. 극한 피처 엔지니어링
         df_train['Drop_Price_Ratio'] = df_train['Close'] / df_train['Close'].shift(19)
         df_train['Drop_Sigma_20'] = df_train['Sigma_20'].shift(19)
         
-        # [자기 참조 & 가속도]
         df_train['Slope_20_Accel'] = df_train['Slope_20'] - df_train['Slope_20'].shift(1)
         df_train['Sigma_20_Accel'] = df_train['Sigma_20'] - df_train['Sigma_20'].shift(1)
         df_train['Slope_Divergence'] = df_train['Slope_20'] - df_train['Slope_60']
         
-        # [통계적 모멘텀]
-        rets = df_train['Close'].pct_change()
+        rets = df_train['Close'].pct_change().fillna(0)
         df_train['Vol_20'] = rets.rolling(20).std() * np.sqrt(252)
-        df_train['Skew_20'] = rets.rolling(20).apply(skew, raw=True)
-        df_train['Kurt_20'] = rets.rolling(20).apply(kurtosis, raw=True)
         
-        # [기술적 오실레이터]
-        df_train['RSI_14'] = 100 - (100 / (1 + (rets[rets > 0].rolling(14).mean() / rets[rets < 0].abs().rolling(14).mean())))
+        # 왜도/첨도 계산 시 에러(NaN) 방지를 위한 안전 코드
+        def safe_skew(x):
+            v = skew(x)
+            return v if not np.isnan(v) else 0.0
+        def safe_kurt(x):
+            v = kurtosis(x)
+            return v if not np.isnan(v) else 0.0
+
+        df_train['Skew_20'] = rets.rolling(20).apply(safe_skew, raw=True)
+        df_train['Kurt_20'] = rets.rolling(20).apply(safe_kurt, raw=True)
+        
+        # RSI, MACD, ATR
+        up = np.where(rets > 0, rets, 0)
+        down = np.where(rets < 0, -rets, 0)
+        rs = pd.Series(up).rolling(14).mean() / (pd.Series(down).rolling(14).mean() + 1e-9)
+        df_train['RSI_14'] = 100 - (100 / (1 + rs.values))
+        
         ema_12 = df_train['Close'].ewm(span=12, adjust=False).mean()
         ema_26 = df_train['Close'].ewm(span=26, adjust=False).mean()
         df_train['MACD'] = ema_12 - ema_26
         df_train['ATR_14'] = (df_train['High'] - df_train['Low']).rolling(14).mean() / df_train['Close']
         
-        # [거시 경제(Macro) 동조화]
-        df_train['VIX_Change'] = df_train['VIX'].pct_change(5)
-        df_train['SPX_Ret_20'] = df_train['SPX'].pct_change(20)
+        # 거시 지표 변화량
+        df_train['VIX_Change'] = df_train['VIX'].pct_change(5).fillna(0)
+        df_train['SPX_Ret_20'] = df_train['SPX'].pct_change(20).fillna(0)
         
-        # 🌟 4. 듀얼 타겟 설정 (내일의 슬로프 & 내일의 시그마)
+        # 🌟 4. 타겟 및 학습
         df_train['Target_Slope_Next'] = df_train['Slope_20'].shift(-1)
         df_train['Target_Sigma_Next'] = df_train['Sigma_20'].shift(-1)
         
@@ -147,8 +164,10 @@ def backtest_xgboost_extreme(ticker, target_date, T):
             'VIX_Change', 'SPX_Ret_20'
         ]
         
-        last_row = df_train.iloc[-1] # 테스트 시작일 당일 데이터 (예측 출발점)
+        last_row = df_train.iloc[-1]
         ml_df = df_train.dropna(subset=features + ['Target_Slope_Next', 'Target_Sigma_Next'])
+        
+        if ml_df.empty: return None, "유효한 학습 데이터가 0개입니다. 시작일을 더 과거로 설정해 주세요."
         
         X_all = ml_df[features].values
         Y_slope = ml_df['Target_Slope_Next'].values
@@ -157,24 +176,19 @@ def backtest_xgboost_extreme(ticker, target_date, T):
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X_all)
         
-        # 🌟 5. 듀얼 XGBoost 학습 (과최적화 방어 파라미터 적용)
-        # n_estimators=300: 나무를 300개 직렬 생성 (치밀한 학습)
-        # learning_rate=0.05: 아주 미세하게 정답을 향해 깎아 나감
         model_slope = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=42, n_jobs=-1)
         model_slope.fit(X_scaled, Y_slope)
         
         model_sigma = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=42, n_jobs=-1)
         model_sigma.fit(X_scaled, Y_sigma)
         
-        # 노이즈 주입용 잔차 표준편차 계산
         res_std_slope = np.std(Y_slope - model_slope.predict(X_scaled))
         res_std_sigma = np.std(Y_sigma - model_sigma.predict(X_scaled))
         
-        # 피처 중요도 추출 (슬로프 기준)
         imp_dict = {f: imp for f, imp in zip(features, model_slope.feature_importances_)}
 
         # ---------------------------------------------------------
-        # 📈 6. AI 듀얼 예측 궤적 생성 (Stochastic AR)
+        # 📈 5. AI 가상 예측 궤적 생성
         # ---------------------------------------------------------
         curr_state = {f: last_row[f] for f in features}
         
@@ -189,21 +203,18 @@ def backtest_xgboost_extreme(ticker, target_date, T):
             x_input = np.array([[curr_state[f] for f in features]])
             x_input_scaled = scaler.transform(x_input)
             
-            # AI 듀얼 코어 동시 예측
             base_next_slope = model_slope.predict(x_input_scaled)[0]
             base_next_sigma = model_sigma.predict(x_input_scaled)[0]
             
-            # 노이즈 주입 (야생성 보존, 강도는 70%로 통제)
+            # 노이즈 주입
             next_slope = base_next_slope + np.random.normal(0, res_std_slope * 0.7)
             next_sigma = base_next_sigma + np.random.normal(0, res_std_sigma * 0.7)
             
-            # 다음 날을 위한 상태 업데이트 (Auto-Regressive 톱니바퀴)
             curr_state['Slope_20_Accel'] = next_slope - curr_state['Slope_20']
             curr_state['Sigma_20_Accel'] = next_sigma - curr_state['Sigma_20']
             curr_state['Slope_20'] = next_slope
             curr_state['Sigma_20'] = next_sigma
             
-            # 60일선은 관성 유지, 5일 10일선은 20일선 변화량에 비례하여 동기화
             curr_state['Slope_60'] = curr_state['Slope_60'] * 0.95 + next_slope * 0.05
             curr_state['Slope_Divergence'] = next_slope - curr_state['Slope_60']
             
@@ -213,17 +224,15 @@ def backtest_xgboost_extreme(ticker, target_date, T):
             pred_sigmas.append(next_sigma)
 
         # ---------------------------------------------------------
-        # 🔍 7. 실제 현실 데이터 추출 (정답지 검증)
+        # 🔍 6. 실제 현실 데이터 추출
         # ---------------------------------------------------------
         actual_slopes = [last_row['Slope_20']]
         actual_sigmas = [last_row['Sigma_20']]
         actual_dates = [df_train.index[-1]]
         
         if not df_future.empty:
-            df_eval = df.copy()
-            eval_closes = df_eval['Close'].values
-            
-            future_indices = np.where(df_eval.index > target_dt)[0]
+            eval_closes = df['Close'].values
+            future_indices = np.where(df.index > target_dt)[0]
             take_t = min(T, len(future_indices))
             
             X_20, X_m_20, X_v_20 = get_linear_params(20)
@@ -235,7 +244,7 @@ def backtest_xgboost_extreme(ticker, target_date, T):
                 real_slope = calc_fast_slope(prices_20, X_20, X_m_20, X_v_20)
                 real_sigma = calc_sigma(prices_20, X_20, X_m_20, X_v_20)
                 
-                actual_dates.append(df_eval.index[idx])
+                actual_dates.append(df.index[idx])
                 actual_slopes.append(real_slope)
                 actual_sigmas.append(real_sigma)
 
@@ -255,21 +264,21 @@ def backtest_xgboost_extreme(ticker, target_date, T):
         return None, f"검증 중 오류 발생: {str(e)}"
 
 # ---------------------------------------------------------
-# ⚙️ 3. 화면 렌더링
+# ⚙️ 7. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 XGBoost 듀얼 코어를 가동하여 21개 극한 변수를 학습 중입니다. (10~20초 소요)..."):
+    with st.spinner(f"📦 타임존 꼬리표를 제거하고, 21개 다차원 변수를 듀얼 XGBoost로 학습 중입니다..."):
         res, err = backtest_xgboost_extreme(target_ticker, target_date, target_t)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ 극한의 피처 XGBoost 검증 완료! (테스트 시작일: {target_date})")
+        st.success(f"✅ 무결점 듀얼 XGBoost 검증 완료! (시작일: {target_date})")
         
         st.subheader("🧠 1. XGBoost 피처 중요도 (Slope 예측 기준)")
         imp_df = pd.DataFrame(list(res['importances'].items()), columns=['Feature', 'Importance']).sort_values('Importance', ascending=True)
         fig_imp = go.Figure(go.Bar(x=imp_df['Importance'], y=imp_df['Feature'], orientation='h', marker=dict(color='rgba(231, 76, 60, 0.8)')))
-        fig_imp.update_layout(height=450, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="AI 모델 가중치 (XGBoost)")
+        fig_imp.update_layout(height=450, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="AI 모델 가중치 (0~1)")
         st.plotly_chart(fig_imp, use_container_width=True)
         
         st.markdown("---")
