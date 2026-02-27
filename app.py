@@ -4,7 +4,6 @@ import pandas as pd
 import yfinance as yf
 from scipy.stats import linregress
 from scipy.ndimage import uniform_filter
-from pandas.tseries.offsets import BDay
 import time
 import warnings
 
@@ -14,40 +13,34 @@ warnings.filterwarnings('ignore')
 # ⚙️ 1. 페이지 설정 및 UI
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="The Oracle: 3x3x3 퀀트 예언자",
-    page_icon="🔮",
+    page_title="Diamond Exit: 보유자 전용 타점 분석기",
+    page_icon="💎",
     layout="wide"
 )
 
-st.title("🔮 The Oracle: 우량주 3x3x3 퀀트 예언자")
+st.title("💎 Diamond Exit: \"내가 가진 종목, 어디까지 오를까?\"")
 st.markdown("""
-개별 우량주의 티커를 입력하면 **94,550개의 3변수 하이퍼-그리드**를 탐색하여 최적의 파라미터를 찾고, 
-과거의 통계를 바탕으로 **다음 매수/매도 시점을 역산(Forecasting)**합니다.
+이미 보유 중인 주식의 **'최적 매도 타점(익절/손절)'**만 집중적으로 분석합니다.  
+과거 10년 치 상승 파동 데이터를 분석하여, **어깨와 머리의 가격**을 역산하고 **추세가 꺾이는 생명선**을 제시합니다.
 """)
 
 with st.sidebar:
-    st.header("⚙️ 분석 설정")
-    target_ticker = st.text_input("종목 코드 (티커)", value="000660.KS", help="한국 주식은 .KS(코스피) 또는 .KQ(코스닥)를 붙여주세요. 미국 주식은 AAPL 등 그대로 입력합니다.")
-    tax_rate = st.number_input("세율 적용 (%)", value=0.0, step=1.0, help="국내 주식은 0, 해외 주식 및 배당 ETF는 22 또는 15.4를 입력하세요.") / 100.0
-    fee = st.number_input("수수료/슬리피지 (%)", value=0.3, step=0.1) / 100.0
-    run_btn = st.button("🚀 전략 최적화 및 진단 실행", type="primary")
-    
-    st.markdown("---")
-    st.caption("※ 0.1 간격의 초정밀 그리드 탐색을 수행하므로 연산에 1~3분 정도 소요될 수 있습니다.")
+    st.header("⚙️ 내 계좌 정보")
+    target_ticker = st.text_input("종목 코드 (티커)", value="000660.KS", help="한국 주식은 .KS 또는 .KQ")
+    avg_price = st.number_input("내 평균 단가 (원/달러)", value=0.0, step=1000.0, help="현재 평단가를 입력하면 수익률을 계산해 줍니다. (선택사항)")
+    run_btn = st.button("🚀 최적 매도 타점 분석", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. 핵심 최적화 엔진 (캐싱 적용)
+# ⚙️ 2. Exit 전용 2D 최적화 엔진
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def run_oracle_optimization(ticker, tax, fee_rate):
-    # 그리드 설정
-    DROP_RANGE = np.round(np.arange(0.1, 5.1, 0.1), 1)  # 50 steps
-    ENT_RANGE = np.round(np.arange(1.0, 4.1, 0.1), 1)   # 31 steps
-    EXT_RANGE = np.round(np.arange(-1.0, 5.1, 0.1), 1)  # 61 steps
+def run_exit_optimization(ticker):
+    # 출구 전략(Exit) 전용 그리드
+    DROP_RANGE = np.round(np.arange(0.5, 6.1, 0.2), 1)  # 28 steps
+    EXT_RANGE = np.round(np.arange(1.0, 6.1, 0.2), 1)   # 26 steps
     
-    # 데이터 로드
     df = yf.download(ticker, start="2015-01-01", progress=False)
-    if df.empty: return None, "데이터를 불러오지 못했습니다. 티커를 확인해주세요."
+    if df.empty: return None, None, "데이터를 불러오지 못했습니다."
         
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -55,12 +48,9 @@ def run_oracle_optimization(ticker, tax, fee_rate):
     df = df[['Open', 'Close']].dropna()
     closes = df['Close'].values
     opens = df['Open'].values
-    dates = df.index
     n_days = len(closes)
-    years = n_days / 252.0
-    min_trades = max(1, int(1.5 * years))
     
-    # 지표 선계산
+    # 지표 계산
     win = 20
     sigmas = np.full(n_days, 999.0)
     slopes = np.full(n_days, -999.0)
@@ -72,142 +62,73 @@ def run_oracle_optimization(ticker, tax, fee_rate):
         std = np.std(y - (s*x + inter))
         if std > 0: sigmas[i] = (closes[i] - (s*(win-1)+inter)) / std
         if closes[i] > 0: slopes[i] = (s / closes[i]) * 100
-        
-    shape = (len(DROP_RANGE), len(ENT_RANGE), len(EXT_RANGE))
-    ret_grid = np.full(shape, -100.0)
-    adr_grid = np.full(shape, -100.0)
+
+    # 보유자 마인드 백테스트: 추세가 시작될 때(Sigma가 0을 돌파할 때) 샀다고 가정하고, 
+    # 어떤 Ext와 Drop에서 팔아야 가장 수익금이 큰지(Avg Profit) 2D로 찾습니다.
+    shape = (len(DROP_RANGE), len(EXT_RANGE))
+    profit_grid = np.full(shape, -100.0)
     all_res = []
     
-    # 1차 시뮬레이션
     for i_drop, drop in enumerate(DROP_RANGE):
-        for i_ent, ent in enumerate(ENT_RANGE):
-            neg_ent = -ent
-            for i_ext, ext in enumerate(EXT_RANGE):
-                cap = 1.0
-                hold = False
-                buy_p = 0.0
-                ent_slope = 0.0
-                trades = 0
-                wins = 0
-                hold_days = 0
-                
-                for k in range(win, n_days-1):
-                    if not hold:
-                        if sigmas[k] <= neg_ent:
-                            hold = True; buy_p = opens[k+1]; ent_slope = slopes[k]; trades += 1
-                    else:
-                        hold_days += 1
-                        if sigmas[k] >= ext or slopes[k] < (ent_slope - drop):
-                            hold = False
-                            sell_p = opens[k+1]
-                            profit = sell_p - buy_p
-                            tax_amt = profit * tax if profit > 0 else 0
-                            net_ret = ((sell_p - tax_amt) / buy_p) - 1.0 - fee_rate
-                            cap *= (1.0 + net_ret)
-                            if net_ret > 0: wins += 1
-                            
-                if trades >= min_trades:
-                    tot_ret = (cap - 1.0) * 100
-                    adr = (tot_ret / hold_days) if hold_days > 0 else 0
-                    ret_grid[i_drop, i_ent, i_ext] = tot_ret
-                    adr_grid[i_drop, i_ent, i_ext] = adr
-                    
-                    all_res.append({
-                        'Drop': drop, 'Ent': ent, 'Ext': ext,
-                        'TotRet': tot_ret, 'ADR': adr, 'WinRate': (wins/trades)*100,
-                        'Trades': trades, 'Idx': (i_drop, i_ent, i_ext)
-                    })
+        for i_ext, ext in enumerate(EXT_RANGE):
+            hold = False; buy_p = 0.0; ent_slope = 0.0
+            trades = 0; total_profit_pct = 0.0
+            
+            for k in range(win, n_days-1):
+                if not hold:
+                    # 가상의 추세 진입점 (모멘텀 양전환)
+                    if sigmas[k-1] < 0 and sigmas[k] >= 0:
+                        hold = True; buy_p = opens[k+1]; ent_slope = slopes[k]
+                else:
+                    # 목표가 도달 OR 생명선 이탈 시 매도
+                    if sigmas[k] >= ext or slopes[k] < (ent_slope - drop):
+                        hold = False; sell_p = opens[k+1]
+                        ret = (sell_p / buy_p) - 1.0
+                        total_profit_pct += ret
+                        trades += 1
+                        
+            avg_profit = (total_profit_pct / trades * 100) if trades > 0 else 0
+            profit_grid[i_drop, i_ext] = avg_profit
+            all_res.append({'Drop': drop, 'Ext': ext, 'AvgProfit': avg_profit, 'Trades': trades})
 
-    if not all_res: return None, "조건을 만족하는 전략이 없습니다."
-        
-    # Smoothing
-    smooth_ret = uniform_filter(ret_grid, size=3, mode='constant', cval=-100.0)
-    smooth_adr = uniform_filter(adr_grid, size=3, mode='constant', cval=-100.0)
+    if not all_res: return None, None, "분석 불가 종목입니다."
     
     df_res = pd.DataFrame(all_res)
-    df_res['Nb_Ret'] = df_res['Idx'].apply(lambda x: smooth_ret[x])
-    df_res['Nb_ADR'] = df_res['Idx'].apply(lambda x: smooth_adr[x])
+    # 최소 매매 횟수 필터 후 가장 평균 수익이 높은 조합(최적의 매도 타점) 추출
+    valid = df_res[df_res['Trades'] > (n_days/252)] 
+    best_exit = valid.sort_values('AvgProfit', ascending=False).iloc[0]
     
-    # 필터링
-    valid = df_res[df_res['WinRate'] >= 65.0]
-    if valid.empty: valid = df_res[df_res['WinRate'] >= 60.0]
-
-    # TOP 3 선별
-    top_bal = valid.sort_values('Nb_Ret', ascending=False).head(1)
-    top_bal['Type'] = '⚖️ [종합 밸런스형]'
+    # 역사적 광기 구간 (상위 5% 시그마) 추출
+    extreme_sigma = np.percentile(sigmas[sigmas != 999.0], 95)
     
-    long_term = valid[(valid['Ent'] >= 2.5) & (valid['Ext'] >= 2.5)]
-    top_lt = long_term.sort_values('Nb_ADR', ascending=False).head(1) if not long_term.empty else valid.sort_values('TotRet', ascending=False).head(1)
-    top_lt['Type'] = '📦 [장기 보유형]'
-    
-    short_term = valid[(valid['Ent'] < 2.5) & (valid['Ext'] < 2.5)]
-    top_st = short_term.sort_values('Nb_ADR', ascending=False).head(1) if not short_term.empty else valid.sort_values('WinRate', ascending=False).head(1)
-    top_st['Type'] = '⚡ [단기 스윙형]'
-
-    final = pd.concat([top_bal, top_lt, top_st]).drop_duplicates(subset=['Drop', 'Ent', 'Ext'])
-    
-    # ---------------------------------------------------------
-    # 정밀 재시뮬레이션 (Forecasting & History)
-    # ---------------------------------------------------------
+    # 오늘자 지표 계산
     y_last = closes[-win:]
     s_last, inter_last, _, _, _ = linregress(x, y_last)
     L_last = s_last*(win-1) + inter_last
     std_last = np.std(y_last - (s_last*x + inter_last))
     
-    results_data = []
+    cur_price = closes[-1]
+    cur_sigma = sigmas[-1]
+    cur_slope = slopes[-1]
     
-    for _, r in final.iterrows():
-        drop, ent, ext = r['Drop'], r['Ent'], r['Ext']
-        
-        hold = False; buy_p = 0.0; ent_slope = 0.0
-        last_buy_date = None; last_sell_date = None; last_sell_idx = None
-        last_net_ret = 0.0
-        
-        trade_rets, hold_days_list, wait_days_list = [], [], []
-        
-        for k in range(win, n_days-1):
-            if not hold:
-                if sigmas[k] <= -ent:
-                    hold = True; buy_p = opens[k+1]; ent_slope = slopes[k]
-                    last_buy_date = dates[k+1]
-                    if last_sell_idx is not None: wait_days_list.append(k - last_sell_idx)
-            else:
-                if sigmas[k] >= ext or slopes[k] < (ent_slope - drop):
-                    hold = False; sell_p = opens[k+1]
-                    last_sell_date = dates[k+1]; last_sell_idx = k
-                    
-                    profit = sell_p - buy_p
-                    tax_amt = profit * tax if profit > 0 else 0
-                    ret = ((sell_p - tax_amt) / buy_p) - 1.0 - fee_rate
-                    last_net_ret = ret * 100
-                    trade_rets.append(last_net_ret)
-                    
-                    dur = dates.get_loc(last_sell_date) - dates.get_loc(last_buy_date)
-                    hold_days_list.append(dur)
-
-        avg_ret = np.mean(trade_rets) if trade_rets else 0
-        std_ret = np.std(trade_rets) if trade_rets else 0
-        avg_hold = np.mean(hold_days_list) if hold_days_list else 0
-        std_hold = np.std(hold_days_list) if hold_days_list else 0
-        avg_wait = np.mean(wait_days_list) if wait_days_list else 0
-        std_wait = np.std(wait_days_list) if wait_days_list else 0
-        
-        target_buy_p = L_last + (-ent * std_last)
-        target_sell_p = L_last + (ext * std_last)
-        
-        results_data.append({
-            'Type': r['Type'], 'Drop': drop, 'Ent': ent, 'Ext': ext,
-            'TotRet': r['TotRet'], 'WinRate': r['WinRate'], 'Trades': r['Trades'],
-            'AvgRet': avg_ret, 'StdRet': std_ret,
-            'AvgHold': avg_hold, 'StdHold': std_hold,
-            'AvgWait': avg_wait, 'StdWait': std_wait,
-            'Hold': hold, 'CurPrice': closes[-1], 'CurSigma': sigmas[-1], 'CurSlope': slopes[-1],
-            'TargetBuy': target_buy_p, 'TargetSell': target_sell_p,
-            'LastBuyDate': last_buy_date, 'LastSellDate': last_sell_date, 
-            'LastNetRet': last_net_ret, 'EntSlope': ent_slope
-        })
-        
-    return results_data, None
+    # 20일 내 최고 기울기 (Trailing Stop 기준점)
+    recent_slopes = slopes[-win:]
+    peak_slope = np.max(recent_slopes[recent_slopes != -999.0])
+    
+    # 가격 역산
+    opt_ext = best_exit['Ext']
+    opt_drop = best_exit['Drop']
+    
+    target_1_price = L_last + (opt_ext * std_last)
+    target_2_price = L_last + (extreme_sigma * std_last)
+    
+    status_data = {
+        'CurPrice': cur_price, 'CurSigma': cur_sigma, 'CurSlope': cur_slope,
+        'PeakSlope': peak_slope, 'Target1': target_1_price, 'Target2': target_2_price,
+        'OptExt': opt_ext, 'OptDrop': opt_drop, 'ExtSigma': extreme_sigma
+    }
+    
+    return status_data, df_res, None
 
 # ---------------------------------------------------------
 # ⚙️ 3. 결과 렌더링
@@ -216,72 +137,57 @@ if run_btn:
     if not target_ticker:
         st.warning("티커를 입력해주세요.")
     else:
-        with st.spinner("✨ 시스템이 9만 개의 우주를 탐색 중입니다. 잠시만 기다려주세요..."):
-            start_t = time.time()
-            results, err = run_oracle_optimization(target_ticker, tax_rate, fee)
-            elapsed = time.time() - start_t
+        with st.spinner("✨ 차트에 올라탄 당신을 위해 최적의 하차 지점을 계산 중입니다..."):
+            status, _, err = run_exit_optimization(target_ticker)
             
         if err:
             st.error(err)
         else:
-            st.success(f"✅ 최적화 완료! (탐색 소요 시간: {elapsed:.1f}초)")
+            # 내 수익률 계산
+            my_rtn_str = "평단가 미입력"
+            my_profit = 0
+            if avg_price > 0:
+                my_profit = (status['CurPrice'] / avg_price) - 1.0
+                color = "red" if my_profit > 0 else "blue"
+                sign = "+" if my_profit > 0 else ""
+                my_rtn_str = f"<span style='color:{color}; font-weight:bold;'>{sign}{my_profit*100:.2f}%</span>"
+
+            # 현재 상태 판단
+            is_danger = status['CurSlope'] < (status['PeakSlope'] - status['OptDrop'])
+            is_overbought = status['CurSigma'] >= status['OptExt']
             
-            for res in results:
-                with st.container():
-                    st.markdown(f"### {res['Type']} `(Drop: {res['Drop']} / Ent: {res['Ent']} / Ext: {res['Ext']})`")
-                    
-                    # 통계 요약 컬럼
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("10년 누적 수익률", f"{res['TotRet']:,.0f}%")
-                    c2.metric("매매 승률", f"{res['WinRate']:.1f}%", f"총 {int(res['Trades'])}회 매매")
-                    c3.metric("평균 매매 수익", f"{res['AvgRet']:.2f}%", f"편차 ±{res['StdRet']:.2f}%", delta_color="off")
-                    c4.metric("평균 보유/대기", f"{res['AvgHold']:.1f}일", f"대기 {res['AvgWait']:.1f}일", delta_color="off")
-                    
-                    # 상태 분석 창
-                    if res['Hold']:
-                        st.info("🟢 **[현재 상태] : 보유 중 (Holding)**")
-                        
-                        min_hold = max(0, int(res['AvgHold'] - res['StdHold']))
-                        max_hold = int(res['AvgHold'] + res['StdHold'])
-                        est_sell_start = res['LastBuyDate'] + BDay(min_hold)
-                        est_sell_end = res['LastBuyDate'] + BDay(max_hold)
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write(f"- **최근 매수일:** {res['LastBuyDate'].strftime('%Y-%m-%d')} (진입 기울기: {res['EntSlope']:.2f}%)")
-                            st.write(f"- **현재 가격:** ₩{res['CurPrice']:,.0f} (시그마: {res['CurSigma']:.2f} / 기울기: {res['CurSlope']:.2f}%)")
-                        with col2:
-                            st.write(f"🎯 **목표 익절가:** 약 ₩{res['TargetSell']:,.0f} (Sigma {res['Ext']} 도달 시)")
-                            st.write(f"🚨 **손절 기준선:** 기울기 {res['EntSlope'] - res['Drop']:.2f}% 이탈 시 시가 매도")
-                        
-                        st.warning(f"⏳ **예상 매도권:** {est_sell_start.strftime('%Y-%m-%d')} ~ {est_sell_end.strftime('%Y-%m-%d')} 내외")
-                        
-                    else:
-                        st.error("🔵 **[현재 상태] : 대기 중 (Waiting / 현금 보유)**")
-                        
-                        if res['LastSellDate'] is not None:
-                            # FOMO 방지 멘탈 케어 로직 추가
-                            st.markdown(f"""
-                            > 🎯 **직전 매매 성과:** {res['LastBuyDate'].strftime('%Y-%m-%d')} 매수 $\\rightarrow$ {res['LastSellDate'].strftime('%Y-%m-%d')} 매도  
-                            > 💰 **최종 확정 수익률: <span style='color:#e74c3c; font-size:1.1em; font-weight:bold;'>+{res['LastNetRet']:.2f}%</span>**
-                            
-                            *💡 **Mental Care:** 이미 이 전략으로 성공적인 수익을 거두었습니다. 최근 매도 이후 주가가 올랐더라도 아쉬워하지 마세요. 그것은 내 몫이 아닙니다. 다음 '과매도' 구간까지 현금을 쥐고 기다리는 자만이 복리를 누릴 수 있습니다.*
-                            """, unsafe_allow_html=True)
-                            
-                            min_wait = max(0, int(res['AvgWait'] - res['StdWait']))
-                            max_wait = int(res['AvgWait'] + res['StdWait'])
-                            est_buy_start = res['LastSellDate'] + BDay(min_wait)
-                            est_buy_end = res['LastSellDate'] + BDay(max_wait)
-                            
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.write(f"- **현재 가격:** ₩{res['CurPrice']:,.0f} (시그마: {res['CurSigma']:.2f})")
-                            with col2:
-                                st.write(f"🎯 **다음 목표 매수가:** 약 ₩{res['TargetBuy']:,.0f} (Sigma -{res['Ent']} 터치)")
-                                
-                            st.warning(f"⏳ **예상 매수권:** {est_buy_start.strftime('%Y-%m-%d')} ~ {est_buy_end.strftime('%Y-%m-%d')} 내외")
-                        else:
-                            st.write(f"- **현재 가격:** ₩{res['CurPrice']:,.0f} (시그마: {res['CurSigma']:.2f})")
-                            st.write(f"🎯 **목표 매수가:** 약 ₩{res['TargetBuy']:,.0f} (Sigma -{res['Ent']} 터치)")
-                            
-                    st.markdown("---")
+            st.markdown(f"### 📊 현재 내 계좌 상태 (현재가: ₩{status['CurPrice']:,.0f})")
+            st.markdown(f"**현재 추정 수익률:** {my_rtn_str}", unsafe_allow_html=True)
+            st.markdown("---")
+
+            c1, c2, c3 = st.columns(3)
+            
+            # 1차 목표가 (통계적 어깨)
+            with c1:
+                st.info("🎯 **1차 목표가 (통계적 어깨)**")
+                st.metric(label=f"목표 시그마: {status['OptExt']:.2f}", value=f"₩{status['Target1']:,.0f}")
+                st.caption("과거 통계상 이 지점에서 팔았을 때 누적 수익금이 가장 컸습니다. 분할 매도 시작점입니다.")
+                
+            # 2차 목표가 (역사적 광기)
+            with c2:
+                st.success("🔥 **2차 목표가 (역사적 광기)**")
+                st.metric(label=f"상위 5% 시그마: {status['ExtSigma']:.2f}", value=f"₩{status['Target2']:,.0f}")
+                st.caption("과거 10년간 이 주식이 이성을 잃고 올랐던 최고점 라인입니다. 전량 익절을 고려하세요.")
+                
+            # 트레일링 스탑 (생명선)
+            with c3:
+                st.error("🚨 **생명선 (Trailing Stop)**")
+                cut_slope = status['PeakSlope'] - status['OptDrop']
+                st.metric(label="손절/익절 각도 (Slope)", value=f"{cut_slope:.2f}%")
+                st.caption(f"최근 최고 각도({status['PeakSlope']:.2f}%)에서 {status['OptDrop']:.1f}% 꺾이면 추세가 죽은 것입니다. 이 각도가 깨지면 미련 없이 던지세요.")
+                
+            st.markdown("---")
+            
+            # AI 행동 지침
+            st.subheader("🤖 미스터 주의 행동 지침")
+            if is_danger:
+                st.markdown(f"> 🚨 **[추세 이탈 경보]** 최근의 상승 추세(기울기)가 통계적 임계점({status['OptDrop']}%) 이상 꺾였습니다. 수익 중이라면 **즉시 익절**, 손실 중이라면 **칼손절**을 권장합니다. 미련을 가지면 지하실을 봅니다.")
+            elif is_overbought:
+                st.markdown(f"> 💰 **[수익 실현 구간]** 주가가 1차 목표가를 돌파했습니다! 보유 물량의 절반 이상을 매도하여 **수익을 확정** 지으세요. 나머지는 2차 목표가(₩{status['Target2']:,.0f}) 또는 생명선이 깨질 때까지 들고 가보십시오.")
+            else:
+                st.markdown(f"> 🚀 **[쾌속 질주 중]** 아직 목표가에 도달하지 않았고, 추세(기울기)도 꺾이지 않았습니다. **안심하고 계속 홀딩(Hold) 하십시오.** 주가가 오를수록 생명선(각도)도 따라 올라가며 여러분의 수익을 지켜줄 것입니다.")
