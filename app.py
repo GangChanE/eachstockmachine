@@ -8,7 +8,6 @@ from pandas.tseries.offsets import BDay
 import plotly.graph_objects as go
 import math
 import warnings
-import random
 
 warnings.filterwarnings('ignore')
 
@@ -16,8 +15,8 @@ warnings.filterwarnings('ignore')
 # ⚙️ 0. 호가 교정 함수
 # ---------------------------------------------------------
 def round_to_tick(price, up=False):
-    if price is None or np.isnan(price): return None
-    if price <= 0: return 0 # 지수 하락 시 방어
+    if price is None or np.isnan(price) or price <= 0: return 0
+    if price > 1e9: return int(price) # 비정상 폭등 시 예외 처리
     
     if price < 2000: tick = 1
     elif price < 5000: tick = 5
@@ -35,26 +34,27 @@ def round_to_tick(price, up=False):
 # ---------------------------------------------------------
 st.set_page_config(page_title="Quantum Oracle V12", page_icon="🔮", layout="wide")
 
-st.title("🔮 The Quantum Oracle V12: GBM & 풀 마르코프 체인")
+st.title("🔮 The Quantum Oracle V12: 몬테카를로 & 로그 스케일 검증")
 st.markdown("""
-**1. 기하 브라운 운동(GBM):** 주가의 지수적 특성과 복리 효과를 반영하여 로그 스케일의 완벽한 궤적을 그립니다.  
-**2. 풀 마르코프 체인(Full Markov Chain):** 5대 장세가 고착되지 않고, 과거 통계 확률에 따라 다이내믹하게 전환됩니다.
+과거 데이터를 기반으로 **1,000번의 몬테카를로 시뮬레이션(평행우주)**을 돌려, 장세가 자유롭게 전환되는 완벽한 지수적(Exponential) 주가 궤적을 그립니다.  
+과거 시점으로 타임머신을 타고 들어가 예측 밴드와 실제 시장의 흐름을 비교해 보세요.
 """)
 
 with st.sidebar:
     st.header("⚙️ 타임머신 & 계좌 정보")
     target_ticker = st.text_input("종목 코드 (티커)", value="000660.KS")
-    target_date = st.date_input("분석 기준일 (타임머신 날짜)")
+    target_date = st.date_input("분석 기준일 (과거 타임머신 날짜)")
     entry_price = st.number_input("기준일 매수 단가 (원)", value=0.0, step=1000.0)
     tax_rate = st.number_input("세율 적용 (%)", value=0.0, step=1.0) / 100.0
     fee = 0.003
-    run_btn = st.button("🚀 지수적 궤적 및 타점 생성", type="primary")
+    use_log_scale = st.checkbox("📈 Y축 로그 스케일(Log Scale) 적용", value=False, help="복리로 팽창하는 궤적을 직선적 비율로 교정하여 봅니다.")
+    run_btn = st.button("🚀 1,000회 몬테카를로 검증 시작", type="primary")
 
 # ---------------------------------------------------------
-# ⚙️ 2. 핵심 분석 엔진 (미래 데이터 차단 + GBM + Markov)
+# ⚙️ 2. 핵심 분석 엔진 (Monte Carlo + Markov Chain)
 # ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
+def run_monte_carlo_oracle(ticker, target_date, ent_price, tax, fee_rate):
     try:
         raw = yf.download(ticker, start="2014-01-01", progress=False)
         if raw.empty: return None, "데이터 로드 실패."
@@ -66,7 +66,7 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
         df_all = df_all[['Open', 'Close']].dropna()
         target_dt = pd.to_datetime(target_date)
         
-        # 🛡️ 데이터 분리 (과거 학습 / 미래 검증)
+        # 🛡️ 데이터 분리
         df_past = df_all[df_all.index <= target_dt]
         df_future = df_all[df_all.index > target_dt]
         
@@ -75,10 +75,9 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
         dates = df_past.index
         n_days = len(closes)
         
-        if n_days < 120: return None, "과거 데이터가 부족하여 분석할 수 없습니다."
+        if n_days < 120: return None, "과거 데이터 부족."
 
-        win20 = 20
-        win60 = 60
+        win20, win60 = 20, 60
         sigmas = np.full(n_days, 999.0)
         slopes20 = np.full(n_days, -999.0)
         ann_slopes60 = np.full(n_days, -999.0) 
@@ -97,9 +96,9 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
             s60, _, _, _, _ = linregress(x60, y60)
             if closes[i] > 0: ann_slopes60[i] = (s60 / closes[i]) * 100 * 252
 
-        # 🚦 장세 분류
+        # 🚦 1. 장세 분류
         REGIME_NAMES = ['Strong Bull', 'Bull', 'Random', 'Bear', 'Strong Bear']
-        regimes = np.full(n_days, 'Unknown', dtype=object)
+        regimes = np.full(n_days, 'Random', dtype=object)
         regimes[ann_slopes60 >= 40] = 'Strong Bull'
         regimes[(ann_slopes60 >= 10) & (ann_slopes60 < 40)] = 'Bull'
         regimes[(ann_slopes60 > -10) & (ann_slopes60 < 10)] = 'Random'
@@ -111,7 +110,7 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
         cur_slope = slopes20[-1]
         cur_price = closes[-1]
         
-        # 📊 1. 마르코프 전이 행렬 (Transition Matrix) 및 상태 통계 구축
+        # 📊 2. 라플라스 스무딩이 적용된 전이 행렬 구축
         regime_blocks = []
         curr_r = regimes[win60]
         start_idx = win60
@@ -122,23 +121,18 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 start_idx = i
         regime_blocks.append({'regime': curr_r, 'duration': n_days - start_idx})
         
-        # 전이 행렬 초기화
-        trans_matrix = {r1: {r2: 0 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES}
+        # Laplace Smoothing (+0.1) : 절대 고착되지 않음
+        trans_matrix = {r1: {r2: 0.1 for r2 in REGIME_NAMES} for r1 in REGIME_NAMES}
         for i in range(len(regime_blocks) - 1):
             r_from = regime_blocks[i]['regime']
             r_to = regime_blocks[i+1]['regime']
             if r_from in trans_matrix and r_to in trans_matrix:
                 trans_matrix[r_from][r_to] += 1
                 
-        # 확률로 변환
         for r1 in REGIME_NAMES:
             total = sum(trans_matrix[r1].values())
-            if total > 0:
-                for r2 in REGIME_NAMES: trans_matrix[r1][r2] /= total
-            else:
-                trans_matrix[r1]['Random'] = 1.0 # 데이터 없으면 횡보로
+            for r2 in REGIME_NAMES: trans_matrix[r1][r2] /= total
 
-        # 장세별 통계 (로그 수익률 기반 GBM 파라미터 계산)
         regime_stats = {}
         for r in REGIME_NAMES:
             r_blocks = [b for b in regime_blocks if b['regime'] == r]
@@ -150,66 +144,59 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
                 if idx + 1 < n_days and closes[idx] > 0 and closes[idx+1] > 0: 
                     log_rets.append(np.log(closes[idx+1] / closes[idx]))
                     
-            mu = np.mean(log_rets) if log_rets else 0.0     # 일일 로그 수익률 평균
-            sigma = np.std(log_rets) if log_rets else 0.02  # 일일 로그 변동성
-            
-            regime_stats[r] = {'avg_dur': max(5, int(avg_dur)), 'mu': mu, 'sigma': sigma}
+            mu = np.mean(log_rets) if log_rets else 0.0     
+            sigma = np.std(log_rets) if log_rets else 0.02  
+            regime_stats[r] = {'avg_dur': max(3, int(avg_dur)), 'mu': mu, 'sigma': sigma}
 
-        # 📈 2. 360일 궤적 생성 (Stochastic Transition + GBM)
-        np.random.seed() # 랜덤 시드 초기화
-        
+        # 📈 3. 몬테카를로 시뮬레이션 (1,000 평행우주 생성)
+        n_sim = 1000
+        days_ahead = 360
+        sim_prices = np.zeros((n_sim, days_ahead))
         last_block = regime_blocks[-1]
-        c_r = current_regime if current_regime in REGIME_NAMES else 'Random'
-        r_d = max(1, regime_stats[c_r]['avg_dur'] - last_block['duration'])
         
-        path_regimes = []
-        while len(path_regimes) < 360:
-            take = min(r_d, 360 - len(path_regimes))
-            path_regimes.extend([c_r] * take)
+        np.random.seed()
+        
+        for i in range(n_sim):
+            c_r = current_regime if current_regime in REGIME_NAMES else 'Random'
+            r_d = max(1, regime_stats[c_r]['avg_dur'] - last_block['duration'] + np.random.randint(-2, 3))
             
-            # 다음 장세를 '확률 행렬'에 따라 뽑기 (고착화 방지)
-            probs = [trans_matrix[c_r][nxt] for nxt in REGIME_NAMES]
-            c_r = np.random.choice(REGIME_NAMES, p=probs)
-            
-            # 수명은 정규분포를 섞어 약간의 랜덤성 부여
-            mean_dur = regime_stats[c_r]['avg_dur']
-            r_d = max(5, int(np.random.normal(mean_dur, mean_dur * 0.2))) 
+            price = cur_price
+            for t in range(days_ahead):
+                if r_d <= 0:
+                    probs = [trans_matrix[c_r][nxt] for nxt in REGIME_NAMES]
+                    probs = np.array(probs) / sum(probs)
+                    c_r = np.random.choice(REGIME_NAMES, p=probs)
+                    mean_dur = regime_stats[c_r]['avg_dur']
+                    r_d = max(3, int(np.random.normal(mean_dur, mean_dur * 0.2)))
+                
+                mu = regime_stats[c_r]['mu']
+                sig = regime_stats[c_r]['sigma']
+                
+                # 순수 기하 브라운 운동 (지수적 폭발 구현)
+                price *= np.exp(np.random.normal(mu, sig))
+                sim_prices[i, t] = price
+                r_d -= 1
 
+        # 백분위수 추출
+        low_90_arr = np.percentile(sim_prices, 5, axis=0)
+        high_90_arr = np.percentile(sim_prices, 95, axis=0)
+        center_arr = np.percentile(sim_prices, 50, axis=0)
+        
         trajectory = []
         base_date = dates[-1]
         max_pred_date = base_date
         
-        # 누적 파라미터 계산을 통한 GBM 90% 밴드
-        cum_mu = 0.0
-        cum_var = 0.0
-        
-        for t, r in enumerate(path_regimes):
-            mu = regime_stats[r]['mu']
-            sig = regime_stats[r]['sigma']
-            
-            cum_mu += (mu - 0.5 * (sig ** 2))
-            cum_var += (sig ** 2)
-            
-            # 90% 신뢰구간 (정규분포 Z값 1.645)
-            std_cum = np.sqrt(cum_var)
-            
-            center_price = cur_price * np.exp(cum_mu)
-            low_p = cur_price * np.exp(cum_mu - 1.645 * std_cum)
-            high_p = cur_price * np.exp(cum_mu + 1.645 * std_cum)
-            
+        for t in range(days_ahead):
             pred_date = base_date + BDay(t + 1)
             max_pred_date = pred_date
-            
-            display_name = {'Strong Bull': '🔥강한상승', 'Bull': '📈상승', 'Random': '⚖️횡보', 'Bear': '📉하락', 'Strong Bear': '🧊강한하락'}.get(r, r)
-            
             trajectory.append({
-                'T': t+1, 'Date': pred_date, 'Regime': display_name,
-                'Center': round_to_tick(center_price, up=False),
-                'Low90': round_to_tick(low_p, up=False), 
-                'High90': round_to_tick(high_p, up=True)
+                'Date': pred_date,
+                'Center': round_to_tick(center_arr[t], up=False),
+                'Low90': round_to_tick(low_90_arr[t], up=False),
+                'High90': round_to_tick(high_90_arr[t], up=True)
             })
 
-        # 📈 3. 실제 미래 데이터 추출 (검증용 Overlay)
+        # 검증용 실제 데이터
         actual_future_dates = []
         actual_future_prices = []
         if not df_future.empty:
@@ -253,34 +240,26 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
             df_res = pd.DataFrame(all_res)
             df_res['Nb_Ret'] = df_res.apply(lambda r: smooth_ret[np.where(DROP_RANGE==r['Drop'])[0][0], np.where(EXT_RANGE==r['Ext'])[0][0]], axis=1)
             
-            # 단기 스윙형
             short_df = df_res[(df_res['Ext'] <= 2.0) & (df_res['Drop'] <= 2.0)]
             if not short_df.empty:
                 top_short = short_df.sort_values('Nb_Ret', ascending=False).head(5)
-                s_drop = top_short.iloc[0]['Drop']
-                s_min_ext, s_max_ext = top_short['Ext'].min(), top_short['Ext'].max()
-                if s_max_ext - s_min_ext < 0.2: s_max_ext += 0.3
-                
                 dual_results['short'] = {
-                    'opt_drop': s_drop, 'min_ext': s_min_ext, 'max_ext': s_max_ext,
-                    'target_min': round_to_tick(L_last + (s_min_ext * std_last), up=True),
-                    'target_max': round_to_tick(L_last + (s_max_ext * std_last), up=True),
-                    'cut_slope': cur_slope - s_drop
+                    'opt_drop': top_short.iloc[0]['Drop'], 
+                    'min_ext': top_short['Ext'].min(), 'max_ext': max(top_short['Ext'].max(), top_short['Ext'].min()+0.3),
+                    'target_min': round_to_tick(L_last + (top_short['Ext'].min() * std_last), up=True),
+                    'target_max': round_to_tick(L_last + (max(top_short['Ext'].max(), top_short['Ext'].min()+0.3) * std_last), up=True),
+                    'cut_slope': cur_slope - top_short.iloc[0]['Drop']
                 }
 
-            # 장기 보유형
             long_df = df_res[(df_res['Ext'] >= 2.5) & (df_res['Drop'] >= 2.0)]
             if not long_df.empty:
                 top_long = long_df.sort_values('Nb_Ret', ascending=False).head(5)
-                l_drop = top_long.iloc[0]['Drop']
-                l_min_ext, l_max_ext = top_long['Ext'].min(), top_long['Ext'].max()
-                if l_max_ext - l_min_ext < 0.2: l_max_ext += 0.3
-                
                 dual_results['long'] = {
-                    'opt_drop': l_drop, 'min_ext': l_min_ext, 'max_ext': l_max_ext,
-                    'target_min': round_to_tick(L_last + (l_min_ext * std_last), up=True),
-                    'target_max': round_to_tick(L_last + (l_max_ext * std_last), up=True),
-                    'cut_slope': cur_slope - l_drop
+                    'opt_drop': top_long.iloc[0]['Drop'], 
+                    'min_ext': top_long['Ext'].min(), 'max_ext': max(top_long['Ext'].max(), top_long['Ext'].min()+0.3),
+                    'target_min': round_to_tick(L_last + (top_long['Ext'].min() * std_last), up=True),
+                    'target_max': round_to_tick(L_last + (max(top_long['Ext'].max(), top_long['Ext'].min()+0.3) * std_last), up=True),
+                    'cut_slope': cur_slope - top_long.iloc[0]['Drop']
                 }
 
         display_curr = {'Strong Bull': '🔥강한상승', 'Bull': '📈상승', 'Random': '⚖️횡보', 'Bear': '📉하락', 'Strong Bear': '🧊강한하락'}.get(current_regime, current_regime)
@@ -300,29 +279,34 @@ def run_v12_oracle(ticker, target_date, ent_price, tax, fee_rate):
 # ⚙️ 3. 화면 렌더링
 # ---------------------------------------------------------
 if run_btn:
-    with st.spinner(f"📦 GBM (기하브라운운동) 및 마르코프 전이 연산 중..."):
-        res, err = run_v12_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
+    with st.spinner(f"📦 1,000개의 평행우주를 생성하여 지수적 주가 궤적을 연산 중입니다..."):
+        res, err = run_monte_carlo_oracle(target_ticker, target_date, entry_price, tax_rate, fee)
         
     if err:
         st.error(err)
     else:
-        st.success(f"✅ 타임머신 분석 완료! (분석 기준일: {target_date})")
+        st.success(f"✅ 연산 완료!")
         
-        st.subheader("📈 1. GBM 360일 지수적 궤적 vs 실제 주가 검증")
-        st.markdown(f"> **분석 기준일({target_date})** 시점의 **장세({res['curr_regime']})**를 시작으로, 확률적 전이(Markov)와 복리 효과(GBM)를 반영하여 그려낸 나팔꽃 형태의 로그 스케일 밴드입니다.")
+        st.subheader("📈 1. 1,000회 몬테카를로 360일 지수 궤적 vs 실제 주가")
         
+        if use_log_scale:
+            st.info("ℹ️ **로그 스케일(Log Scale) 모드 활성화됨:** 복리로 폭발하는 궤적의 비율적 대칭성이 수학적으로 직관화되어 보입니다.")
+        else:
+            st.info("ℹ️ **선형 스케일(Linear Scale) 모드 활성화됨:** 주가의 지수적 팽창(우측 꼬리 솟구침)이 시각적으로 과장되어 나타날 수 있습니다.")
+            
         traj_df = pd.DataFrame(res['trajectory'])
         fig = go.Figure()
         
         fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['High90'], mode='lines', line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low90'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.2)', name='90% GBM 예측 밴드'))
-        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Center'], mode='lines', line=dict(color='#e74c3c', width=2, dash='dot'), name='예상 중심 궤적', customdata=traj_df['Regime'], hovertemplate="<b>%{x|%Y-%m-%d} (T+%{text})</b><br>예상 장세: %{customdata}<br>예상가: ₩%{y:,.0f}<extra></extra>", text=traj_df['T']))
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Low90'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 152, 219, 0.2)', name='90% 확률 밴드'))
+        fig.add_trace(go.Scatter(x=traj_df['Date'], y=traj_df['Center'], mode='lines', line=dict(color='#e74c3c', width=2, dash='dot'), name='예상 통계적 중심', hovertemplate="<b>%{x|%Y-%m-%d}</b><br>예상가: ₩%{y:,.0f}<extra></extra>"))
         
         if res['actual_dates'] and len(res['actual_dates']) > 0:
             fig.add_trace(go.Scatter(x=res['actual_dates'], y=res['actual_prices'], mode='lines', line=dict(color='black', width=3), name='실제 시장 흐름 (Reality)'))
             
-        # y축을 로그 스케일로 표시하려면 주석 해제 (단, 변동폭이 너무 크지 않으면 linear도 무방함)
-        # fig.update_layout(yaxis_type="log")
+        # 🌟 로그 스케일 토글 반영 
+        if use_log_scale:
+            fig.update_layout(yaxis_type="log")
             
         fig.update_layout(hovermode="x unified", height=500, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="미래 날짜", yaxis_title="주가 (원)")
         st.plotly_chart(fig, use_container_width=True)
@@ -336,7 +320,7 @@ if run_btn:
         with c1:
             st.markdown("#### ⚡ [단기 스윙형] 엑시트")
             if dual['short']:
-                st.info(f"**목표 매도 구간 (Sigma {dual['short']['min_ext']:.1f} ~ {dual['short']['max_ext']:.1f})**\n### ₩{dual['short']['target_min']:,} ~ ₩{dual['short']['target_max']:,}")
+                st.info(f"**목표 매도 구간**\n### ₩{dual['short']['target_min']:,} ~ ₩{dual['short']['target_max']:,}")
                 st.error(f"**생명선 이탈 기준**\n### 기울기 {dual['short']['cut_slope']:.2f}% (당시 {res['cur_slope']:.2f}%)")
             else:
                 st.write("단기 스윙 데이터 부족.")
@@ -344,7 +328,7 @@ if run_btn:
         with c2:
             st.markdown("#### 📦 [장기 추세형] 엑시트")
             if dual['long']:
-                st.success(f"**목표 매도 구간 (Sigma {dual['long']['min_ext']:.1f} ~ {dual['long']['max_ext']:.1f})**\n### ₩{dual['long']['target_min']:,} ~ ₩{dual['long']['target_max']:,}")
+                st.success(f"**목표 매도 구간**\n### ₩{dual['long']['target_min']:,} ~ ₩{dual['long']['target_max']:,}")
                 st.error(f"**생명선 이탈 기준**\n### 기울기 {dual['long']['cut_slope']:.2f}% (당시 {res['cur_slope']:.2f}%)")
             else:
                 st.write("장기 추세 데이터 부족.")
